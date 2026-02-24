@@ -60,11 +60,8 @@ docker run -d \
   --name multiroom-audio \
   -p 8096:8096 \
   --device /dev/snd:/dev/snd \
-  -v /proc/asound:/host/asound:ro \
   ghcr.io/chrisuthe/multiroom-audio:latest
 ```
-
-> **Note**: The `/proc/asound` mount enables device capability detection (sample rates, bit depths). It's optional but recommended for the full feature set.
 
 ### Step 2: Open the Web Interface
 
@@ -133,7 +130,6 @@ Or in Docker Compose:
 volumes:
   - ./config:/app/config
   - /etc/asound.conf:/etc/asound.conf:ro
-  - /proc/asound:/host/asound:ro  # Optional: enables device capability detection
 ```
 
 After restarting the container, your custom ALSA devices will appear in the device selection dropdown.

@@ -1,6 +1,5 @@
 using MultiRoomAudio.Models;
 using MultiRoomAudio.Services;
-using MultiRoomAudio.Utilities;
 
 namespace MultiRoomAudio.Controllers;
 
@@ -10,23 +9,6 @@ namespace MultiRoomAudio.Controllers;
 /// </summary>
 public static class CardsEndpoint
 {
-    /// <summary>
-    /// Registers PulseAudio sound card profile management API endpoints with the application.
-    /// </summary>
-    /// <remarks>
-    /// Endpoints:
-    /// <list type="bullet">
-    /// <item>GET /api/cards - List all sound cards with profiles</item>
-    /// <item>GET /api/cards/saved - Get saved profile configurations</item>
-    /// <item>GET /api/cards/{nameOrIndex} - Get specific card details</item>
-    /// <item>PUT /api/cards/{nameOrIndex}/profile - Set active card profile</item>
-    /// <item>PUT /api/cards/{nameOrIndex}/mute - Set card mute state in real-time</item>
-    /// <item>PUT /api/cards/{nameOrIndex}/boot-mute - Set boot mute preference</item>
-    /// <item>PUT /api/cards/{nameOrIndex}/max-volume - Set card max volume limit</item>
-    /// <item>DELETE /api/cards/{nameOrIndex}/saved - Remove saved profile</item>
-    /// </list>
-    /// </remarks>
-    /// <param name="app">The WebApplication to register endpoints on.</param>
     public static void MapCardsEndpoints(this WebApplication app)
     {
         var group = app.MapGroup("/api/cards")
@@ -34,25 +16,34 @@ public static class CardsEndpoint
             .WithOpenApi();
 
         // GET /api/cards - List all sound cards with their profiles
-        group.MapGet("/", (CardProfileService service, ILoggerFactory loggerFactory) =>
+        group.MapGet("/", (CardProfileService service, ILoggerFactory lf) =>
         {
-            var logger = loggerFactory.CreateLogger("CardsEndpoint");
+            var logger = lf.CreateLogger("CardsEndpoint");
             logger.LogDebug("API: GET /api/cards");
-            return ApiExceptionHandler.Execute(() =>
+
+            try
             {
                 var cards = service.GetCards().ToList();
                 logger.LogDebug("API: Found {CardCount} sound cards", cards.Count);
+
                 return Results.Ok(new CardsListResponse(cards, cards.Count));
-            }, logger, "enumerate sound cards");
+            }
+            catch (Exception ex)
+            {
+                logger.LogError(ex, "API: Failed to enumerate sound cards");
+                return Results.Problem(
+                    detail: ex.Message,
+                    statusCode: 500,
+                    title: "Failed to enumerate sound cards");
+            }
         })
         .WithName("ListCards")
         .WithDescription("List all PulseAudio sound cards with their available profiles");
 
         // GET /api/cards/saved - Get saved profile configurations
-        // NOTE: Not called by UI - saved profiles are included in GET /api/cards response
-        group.MapGet("/saved", (CardProfileService service, ILoggerFactory loggerFactory) =>
+        group.MapGet("/saved", (CardProfileService service, ILoggerFactory lf) =>
         {
-            var logger = loggerFactory.CreateLogger("CardsEndpoint");
+            var logger = lf.CreateLogger("CardsEndpoint");
             logger.LogDebug("API: GET /api/cards/saved");
 
             var saved = service.GetSavedProfiles();
@@ -66,11 +57,12 @@ public static class CardsEndpoint
         .WithDescription("Get all saved card profile configurations that will be restored on startup");
 
         // GET /api/cards/{nameOrIndex} - Get specific card
-        group.MapGet("/{nameOrIndex}", (string nameOrIndex, CardProfileService service, ILoggerFactory loggerFactory) =>
+        group.MapGet("/{nameOrIndex}", (string nameOrIndex, CardProfileService service, ILoggerFactory lf) =>
         {
-            var logger = loggerFactory.CreateLogger("CardsEndpoint");
+            var logger = lf.CreateLogger("CardsEndpoint");
             logger.LogDebug("API: GET /api/cards/{CardId}", nameOrIndex);
-            return ApiExceptionHandler.Execute(() =>
+
+            try
             {
                 var card = service.GetCard(nameOrIndex);
                 if (card == null)
@@ -78,8 +70,17 @@ public static class CardsEndpoint
                     logger.LogDebug("API: Card {CardId} not found", nameOrIndex);
                     return Results.NotFound(new ErrorResponse(false, $"Card '{nameOrIndex}' not found"));
                 }
+
                 return Results.Ok(card);
-            }, logger, "get card", nameOrIndex);
+            }
+            catch (Exception ex)
+            {
+                logger.LogError(ex, "API: Failed to get card {CardId}", nameOrIndex);
+                return Results.Problem(
+                    detail: ex.Message,
+                    statusCode: 500,
+                    title: "Failed to get card");
+            }
         })
         .WithName("GetCard")
         .WithDescription("Get details of a specific sound card including available profiles");
@@ -89,9 +90,9 @@ public static class CardsEndpoint
             string nameOrIndex,
             SetCardProfileRequest request,
             CardProfileService service,
-            ILoggerFactory loggerFactory) =>
+            ILoggerFactory lf) =>
         {
-            var logger = loggerFactory.CreateLogger("CardsEndpoint");
+            var logger = lf.CreateLogger("CardsEndpoint");
             logger.LogDebug("API: PUT /api/cards/{CardId}/profile - Setting to {Profile}",
                 nameOrIndex, request.Profile);
 
@@ -139,9 +140,9 @@ public static class CardsEndpoint
             string nameOrIndex,
             SetCardBootMuteRequest request,
             CardProfileService service,
-            ILoggerFactory loggerFactory) =>
+            ILoggerFactory lf) =>
         {
-            var logger = loggerFactory.CreateLogger("CardsEndpoint");
+            var logger = lf.CreateLogger("CardsEndpoint");
             logger.LogDebug("API: PUT /api/cards/{CardId}/boot-mute to {Muted}", nameOrIndex, request.Muted);
 
             var result = service.SetCardBootMute(nameOrIndex, request.Muted);
@@ -168,9 +169,9 @@ public static class CardsEndpoint
             string nameOrIndex,
             SetCardMuteRequest request,
             CardProfileService service,
-            ILoggerFactory loggerFactory) =>
+            ILoggerFactory lf) =>
         {
-            var logger = loggerFactory.CreateLogger("CardsEndpoint");
+            var logger = lf.CreateLogger("CardsEndpoint");
             logger.LogDebug("API: PUT /api/cards/{CardId}/mute to {Muted}", nameOrIndex, request.Muted);
 
             var result = await service.SetCardMuteAsync(nameOrIndex, request.Muted);
@@ -197,9 +198,9 @@ public static class CardsEndpoint
             string nameOrIndex,
             SetCardMaxVolumeRequest request,
             CardProfileService service,
-            ILoggerFactory loggerFactory) =>
+            ILoggerFactory lf) =>
         {
-            var logger = loggerFactory.CreateLogger("CardsEndpoint");
+            var logger = lf.CreateLogger("CardsEndpoint");
             logger.LogDebug("API: PUT /api/cards/{CardId}/max-volume to {MaxVolume}", nameOrIndex, request.MaxVolume);
 
             var result = await service.SetCardMaxVolumeAsync(nameOrIndex, request.MaxVolume);
@@ -225,9 +226,9 @@ public static class CardsEndpoint
         group.MapDelete("/{nameOrIndex}/saved", (
             string nameOrIndex,
             CardProfileService service,
-            ILoggerFactory loggerFactory) =>
+            ILoggerFactory lf) =>
         {
-            var logger = loggerFactory.CreateLogger("CardsEndpoint");
+            var logger = lf.CreateLogger("CardsEndpoint");
             logger.LogDebug("API: DELETE /api/cards/{CardId}/saved", nameOrIndex);
 
             var removed = service.RemoveSavedProfile(nameOrIndex);

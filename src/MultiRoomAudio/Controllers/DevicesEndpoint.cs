@@ -1,8 +1,6 @@
-using System.ComponentModel.DataAnnotations;
 using MultiRoomAudio.Audio;
 using MultiRoomAudio.Models;
 using MultiRoomAudio.Services;
-using MultiRoomAudio.Utilities;
 
 namespace MultiRoomAudio.Controllers;
 
@@ -12,25 +10,6 @@ namespace MultiRoomAudio.Controllers;
 /// </summary>
 public static class DevicesEndpoint
 {
-    /// <summary>
-    /// Registers audio device enumeration and configuration API endpoints with the application.
-    /// </summary>
-    /// <remarks>
-    /// Endpoints:
-    /// <list type="bullet">
-    /// <item>GET /api/devices - List all audio output devices</item>
-    /// <item>GET /api/devices/default - Get default device</item>
-    /// <item>GET /api/devices/{id} - Get specific device</item>
-    /// <item>GET /api/devices/{id}/capabilities - Get device audio format capabilities</item>
-    /// <item>GET /api/devices/aliases - Get all device aliases</item>
-    /// <item>POST /api/devices/refresh - Re-enumerate audio devices</item>
-    /// <item>POST /api/devices/rematch - Force device re-matching</item>
-    /// <item>PUT /api/devices/{id}/alias - Set device alias</item>
-    /// <item>PUT /api/devices/{id}/hidden - Set device visibility</item>
-    /// <item>PUT /api/devices/{id}/max-volume - Set device max volume limit</item>
-    /// </list>
-    /// </remarks>
-    /// <param name="app">The WebApplication to register endpoints on.</param>
     public static void MapDevicesEndpoints(this WebApplication app)
     {
         var group = app.MapGroup("/api/devices")
@@ -46,7 +25,7 @@ public static class DevicesEndpoint
             var logger = loggerFactory.CreateLogger("DevicesEndpoint");
             logger.LogDebug("API: GET /api/devices - Enumerating audio devices via {Backend} backend",
                 backendFactory.BackendName);
-            return ApiExceptionHandler.Execute(() =>
+            try
             {
                 // Get devices enriched with aliases
                 var devices = matchingService.GetEnrichedDevices().ToList();
@@ -70,19 +49,27 @@ public static class DevicesEndpoint
                     defaultDevice = devices.FirstOrDefault(d => d.IsDefault)?.Id,
                     backend = backendFactory.BackendName
                 });
-            }, logger, "enumerate devices");
+            }
+            catch (Exception ex)
+            {
+                logger.LogError(ex, "Failed to enumerate audio devices. {Backend} may not be available",
+                    backendFactory.BackendName);
+                return Results.Problem(
+                    detail: ex.Message,
+                    statusCode: 500,
+                    title: "Failed to enumerate devices");
+            }
         })
         .WithName("ListDevices")
         .WithDescription("List all available audio output devices with aliases");
 
         // GET /api/devices/default - Get default device
-        // NOTE: Not called by UI - UI infers default from the device list. Available for external tools.
-        // This route must be registered BEFORE /{id} to prevent the parameterized route from intercepting it
+        // NOTE: This route must be registered BEFORE /{id} to prevent the parameterized route from intercepting it
         group.MapGet("/default", (BackendFactory backendFactory, ILoggerFactory loggerFactory) =>
         {
             var logger = loggerFactory.CreateLogger("DevicesEndpoint");
             logger.LogDebug("API: GET /api/devices/default");
-            return ApiExceptionHandler.Execute(() =>
+            try
             {
                 var device = backendFactory.GetDefaultDevice();
                 if (device == null)
@@ -94,26 +81,43 @@ public static class DevicesEndpoint
                 logger.LogDebug("Default device: {DeviceName} (index {DeviceIndex})",
                     device.Name, device.Index);
                 return Results.Ok(device);
-            }, logger, "get default device");
+            }
+            catch (Exception ex)
+            {
+                logger.LogError(ex, "Failed to get default audio device");
+                return Results.Problem(
+                    detail: ex.Message,
+                    statusCode: 500,
+                    title: "Failed to get default device");
+            }
         })
         .WithName("GetDefaultDevice")
         .WithDescription("Get the default audio output device");
 
         // GET /api/devices/{id} - Get specific device
-        group.MapGet("/{id}", (string id, DeviceMatchingService matchingService, ILoggerFactory loggerFactory) =>
+        group.MapGet("/{id}", (string id, BackendFactory backendFactory, ILoggerFactory loggerFactory) =>
         {
             var logger = loggerFactory.CreateLogger("DevicesEndpoint");
             logger.LogDebug("API: GET /api/devices/{DeviceId}", id);
-            return ApiExceptionHandler.Execute(() =>
+            try
             {
-                var device = matchingService.GetEnrichedDevice(id);
+                var device = backendFactory.GetDevice(id);
                 if (device == null)
                 {
                     logger.LogDebug("Device {DeviceId} not found", id);
                     return Results.NotFound(new ErrorResponse(false, $"Device '{id}' not found"));
                 }
+
                 return Results.Ok(device);
-            }, logger, "get device", id);
+            }
+            catch (Exception ex)
+            {
+                logger.LogError(ex, "Failed to get device info for {DeviceId}", id);
+                return Results.Problem(
+                    detail: ex.Message,
+                    statusCode: 500,
+                    title: "Failed to get device info");
+            }
         })
         .WithName("GetDevice")
         .WithDescription("Get details of a specific audio device");
@@ -123,7 +127,7 @@ public static class DevicesEndpoint
         {
             var logger = loggerFactory.CreateLogger("DevicesEndpoint");
             logger.LogDebug("API: GET /api/devices/{DeviceId}/capabilities", id);
-            return ApiExceptionHandler.Execute(() =>
+            try
             {
                 var capabilities = backendFactory.GetDeviceCapabilities(id);
                 if (capabilities == null)
@@ -146,7 +150,15 @@ public static class DevicesEndpoint
                     capabilities.PreferredSampleRate,
                     capabilities.PreferredBitDepth
                 });
-            }, logger, "get device capabilities", id);
+            }
+            catch (Exception ex)
+            {
+                logger.LogError(ex, "Failed to get capabilities for device {DeviceId}", id);
+                return Results.Problem(
+                    detail: ex.Message,
+                    statusCode: 500,
+                    title: "Failed to get device capabilities");
+            }
         })
         .WithName("GetDeviceCapabilities")
         .WithDescription("Get audio format capabilities of a specific device (sample rates, bit depths)");
@@ -159,7 +171,7 @@ public static class DevicesEndpoint
         {
             var logger = loggerFactory.CreateLogger("DevicesEndpoint");
             logger.LogDebug("API: POST /api/devices/refresh");
-            return ApiExceptionHandler.Execute(() =>
+            try
             {
                 logger.LogInformation("Refreshing audio device list via {Backend} backend...",
                     backendFactory.BackendName);
@@ -183,13 +195,20 @@ public static class DevicesEndpoint
                     count = devices.Count,
                     backend = backendFactory.BackendName
                 });
-            }, logger, "refresh devices");
+            }
+            catch (Exception ex)
+            {
+                logger.LogError(ex, "Failed to refresh audio devices");
+                return Results.Problem(
+                    detail: ex.Message,
+                    statusCode: 500,
+                    title: "Failed to refresh devices");
+            }
         })
         .WithName("RefreshDevices")
         .WithDescription("Re-enumerate audio devices (detect newly connected USB devices)");
 
         // GET /api/devices/aliases - Get all device aliases
-        // NOTE: Not called by UI - aliases are included in enriched device list from GET /api/devices
         group.MapGet("/aliases", (ConfigurationService config, ILoggerFactory loggerFactory) =>
         {
             var logger = loggerFactory.CreateLogger("DevicesEndpoint");
@@ -206,14 +225,13 @@ public static class DevicesEndpoint
         .WithDescription("Get all device aliases");
 
         // POST /api/devices/rematch - Force device re-matching
-        // NOTE: Not called by UI - available for programmatic use or future admin features
         group.MapPost("/rematch", (
             DeviceMatchingService matchingService,
             ILoggerFactory loggerFactory) =>
         {
             var logger = loggerFactory.CreateLogger("DevicesEndpoint");
             logger.LogDebug("API: POST /api/devices/rematch");
-            return ApiExceptionHandler.Execute(() =>
+            try
             {
                 var results = matchingService.MatchAllDevices();
                 var updatedPlayers = matchingService.UpdatePlayerDevices();
@@ -227,7 +245,15 @@ public static class DevicesEndpoint
                     devicesUnmatched = results.Count(r => r.CurrentSinkName == null),
                     playersUpdated = updatedPlayers.Count
                 });
-            }, logger, "re-match devices");
+            }
+            catch (Exception ex)
+            {
+                logger.LogError(ex, "Failed to re-match devices");
+                return Results.Problem(
+                    detail: ex.Message,
+                    statusCode: 500,
+                    title: "Failed to re-match devices");
+            }
         })
         .WithName("RematchDevices")
         .WithDescription("Re-match persisted device configurations with current sinks and update player configs");
@@ -242,12 +268,14 @@ public static class DevicesEndpoint
         {
             var logger = loggerFactory.CreateLogger("DevicesEndpoint");
             logger.LogDebug("API: PUT /api/devices/{DeviceId}/alias", id);
-            return ApiExceptionHandler.Execute(() =>
+            try
             {
                 // Find the device
                 var device = backendFactory.GetDevice(id);
                 if (device == null)
+                {
                     return Results.NotFound(new ErrorResponse(false, $"Device '{id}' not found"));
+                }
 
                 // Generate stable key and set alias
                 var deviceKey = ConfigurationService.GenerateDeviceKey(device);
@@ -265,7 +293,15 @@ public static class DevicesEndpoint
                         ? $"Alias set to '{request.Alias}'"
                         : "Alias cleared"
                 });
-            }, logger, "set device alias", id);
+            }
+            catch (Exception ex)
+            {
+                logger.LogError(ex, "Failed to set alias for device {DeviceId}", id);
+                return Results.Problem(
+                    detail: ex.Message,
+                    statusCode: 500,
+                    title: "Failed to set device alias");
+            }
         })
         .WithName("SetDeviceAlias")
         .WithDescription("Set a user-friendly alias for a device");
@@ -280,12 +316,14 @@ public static class DevicesEndpoint
         {
             var logger = loggerFactory.CreateLogger("DevicesEndpoint");
             logger.LogDebug("API: PUT /api/devices/{DeviceId}/hidden", id);
-            return ApiExceptionHandler.Execute(() =>
+            try
             {
                 // Find the device
                 var device = backendFactory.GetDevice(id);
                 if (device == null)
+                {
                     return Results.NotFound(new ErrorResponse(false, $"Device '{id}' not found"));
+                }
 
                 // Generate stable key and set hidden status
                 var deviceKey = ConfigurationService.GenerateDeviceKey(device);
@@ -303,7 +341,15 @@ public static class DevicesEndpoint
                         ? "Device hidden from player creation"
                         : "Device unhidden"
                 });
-            }, logger, "set device hidden status", id);
+            }
+            catch (Exception ex)
+            {
+                logger.LogError(ex, "Failed to set hidden status for device {DeviceId}", id);
+                return Results.Problem(
+                    detail: ex.Message,
+                    statusCode: 500,
+                    title: "Failed to set device hidden status");
+            }
         })
         .WithName("SetDeviceHidden")
         .WithDescription("Set whether a device is hidden from player creation");
@@ -319,12 +365,14 @@ public static class DevicesEndpoint
         {
             var logger = loggerFactory.CreateLogger("DevicesEndpoint");
             logger.LogDebug("API: PUT /api/devices/{DeviceId}/max-volume", id);
-            return await ApiExceptionHandler.ExecuteAsync(async () =>
+            try
             {
                 // Find the device
                 var device = backendFactory.GetDevice(id);
                 if (device == null)
+                {
                     return Results.NotFound(new ErrorResponse(false, $"Device '{id}' not found"));
+                }
 
                 // Generate stable key and set max volume in config
                 var deviceKey = ConfigurationService.GenerateDeviceKey(device);
@@ -348,73 +396,18 @@ public static class DevicesEndpoint
                         ? $"Max volume set to {request.MaxVolume}%"
                         : "Max volume limit cleared (using default 100%)"
                 });
-            }, logger, "set device max volume", id);
+            }
+            catch (Exception ex)
+            {
+                logger.LogError(ex, "Failed to set max volume for device {DeviceId}", id);
+                return Results.Problem(
+                    detail: ex.Message,
+                    statusCode: 500,
+                    title: "Failed to set device max volume");
+            }
         })
         .WithName("SetDeviceMaxVolume")
         .WithDescription("Set the maximum volume limit for a device (applied to PulseAudio sink)");
-
-        // GET /api/devices/{id}/hid-status - Get HID button status for a device
-        group.MapGet("/{id}/hid-status", (
-            string id,
-            BackendFactory backendFactory,
-            HidButtonService hidService,
-            ILoggerFactory loggerFactory) =>
-        {
-            var logger = loggerFactory.CreateLogger("DevicesEndpoint");
-            logger.LogDebug("API: GET /api/devices/{DeviceId}/hid-status", id);
-            return ApiExceptionHandler.Execute(() =>
-            {
-                // Find the device
-                var device = backendFactory.GetDevice(id);
-                if (device == null)
-                    return Results.NotFound(new ErrorResponse(false, $"Device '{id}' not found"));
-
-                var status = hidService.GetHidStatus(device);
-
-                return Results.Ok(status);
-            }, logger, "get HID button status", id);
-        })
-        .WithName("GetHidButtonStatus")
-        .WithDescription("Get HID button status for a device (available, enabled, input device path)");
-
-        // PUT /api/devices/{id}/hid-buttons - Enable/disable HID button support
-        group.MapPut("/{id}/hid-buttons", async (
-            string id,
-            HidButtonEnableRequest request,
-            BackendFactory backendFactory,
-            HidButtonService hidService,
-            ILoggerFactory loggerFactory,
-            CancellationToken ct) =>
-        {
-            var logger = loggerFactory.CreateLogger("DevicesEndpoint");
-            logger.LogDebug("API: PUT /api/devices/{DeviceId}/hid-buttons enabled={Enabled}", id, request.Enabled);
-            return await ApiExceptionHandler.ExecuteAsync(async () =>
-            {
-                // Find the device
-                var device = backendFactory.GetDevice(id);
-                if (device == null)
-                    return Results.NotFound(new ErrorResponse(false, $"Device '{id}' not found"));
-
-                HidButtonEnableResponse result;
-                if (request.Enabled)
-                {
-                    result = await hidService.EnableHidButtonsAsync(device, ct);
-                }
-                else
-                {
-                    result = await hidService.DisableHidButtonsAsync(device, ct);
-                }
-
-                logger.LogInformation("HID buttons for device {DeviceId}: {State} - {Message}",
-                    id, result.HidButtonsEnabled ? "enabled" : "disabled", result.Message);
-
-                return result.Success
-                    ? Results.Ok(result)
-                    : Results.BadRequest(result);
-            }, logger, "set HID button state", id);
-        })
-        .WithName("SetHidButtonState")
-        .WithDescription("Enable or disable HID button support for a device (hardware volume/mute buttons)");
     }
 }
 
@@ -431,7 +424,4 @@ public record DeviceHiddenRequest(bool Hidden);
 /// <summary>
 /// Request to set device maximum volume limit.
 /// </summary>
-/// <param name="MaxVolume">Maximum volume limit (0-100), or null to clear the limit.</param>
-public record DeviceMaxVolumeRequest(
-    [property: Range(0, 100, ErrorMessage = "MaxVolume must be between 0 and 100.")]
-    int? MaxVolume);
+public record DeviceMaxVolumeRequest(int? MaxVolume);

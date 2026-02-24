@@ -1,8 +1,6 @@
-using System.ComponentModel.DataAnnotations;
 using MultiRoomAudio.Audio;
 using MultiRoomAudio.Models;
 using MultiRoomAudio.Services;
-using MultiRoomAudio.Utilities;
 
 namespace MultiRoomAudio.Controllers;
 
@@ -11,21 +9,6 @@ namespace MultiRoomAudio.Controllers;
 /// </summary>
 public static class OnboardingEndpoint
 {
-    /// <summary>
-    /// Registers onboarding wizard API endpoints with the application.
-    /// </summary>
-    /// <remarks>
-    /// Endpoints:
-    /// <list type="bullet">
-    /// <item>GET /api/onboarding/status - Get onboarding wizard status</item>
-    /// <item>POST /api/onboarding/complete - Mark onboarding as completed</item>
-    /// <item>POST /api/onboarding/skip - Skip the onboarding wizard</item>
-    /// <item>POST /api/onboarding/reset - Reset onboarding to allow re-running</item>
-    /// <item>POST /api/onboarding/create-players - Batch create players</item>
-    /// <item>POST /api/devices/{id}/test-tone - Play test tone through device</item>
-    /// </list>
-    /// </remarks>
-    /// <param name="app">The WebApplication to register endpoints on.</param>
     public static void MapOnboardingEndpoints(this WebApplication app)
     {
         var group = app.MapGroup("/api/onboarding")
@@ -111,55 +94,21 @@ public static class OnboardingEndpoint
         {
             var logger = loggerFactory.CreateLogger("OnboardingEndpoint");
             logger.LogDebug("API: POST /api/devices/{DeviceId}/test-tone", id);
-            return await ApiExceptionHandler.ExecuteAsync(async () =>
+
+            try
             {
                 // Find the device
                 var device = backendFactory.GetDevice(id);
                 if (device == null)
-                    return Results.NotFound(new ErrorResponse(false, $"Device '{id}' not found"));
-
-                // For multi-channel devices with a specific channel requested,
-                // use PlayChannelToneAsync with --channel-map for direct routing
-                if (!string.IsNullOrEmpty(request?.ChannelName) && device.MaxChannels > 2)
                 {
-                    // Validate channel exists on device if we have channel map info
-                    if (device.ChannelMap != null &&
-                        !device.ChannelMap.Contains(request.ChannelName, StringComparer.OrdinalIgnoreCase))
-                    {
-                        return Results.BadRequest(new ErrorResponse(false,
-                            $"Channel '{request.ChannelName}' not found on device. " +
-                            $"Available channels: {string.Join(", ", device.ChannelMap)}"));
-                    }
-
-                    logger.LogInformation(
-                        "Multi-channel test: Playing to device '{Device}' channel {ChannelName} via --channel-map",
-                        device.Id, request.ChannelName);
-
-                    await toneGenerator.PlayChannelToneAsync(
-                        device.Id,
-                        request.ChannelName,
-                        request.FrequencyHz ?? 1000,
-                        request.DurationMs ?? 1500,
-                        ct);
-
-                    return Results.Ok(new
-                    {
-                        success = true,
-                        message = "Test tone played successfully",
-                        deviceId = id,
-                        deviceName = device.Name,
-                        frequencyHz = request.FrequencyHz ?? 1000,
-                        durationMs = request.DurationMs ?? 1500,
-                        channelName = request.ChannelName
-                    });
+                    return Results.NotFound(new ErrorResponse(false, $"Device '{id}' not found"));
                 }
 
-                // Fallback: stereo devices or whole-device tests use original 2-channel method
+                // Play test tone
                 await toneGenerator.PlayTestToneAsync(
                     device.Id,
                     frequencyHz: request?.FrequencyHz ?? 1000,
                     durationMs: request?.DurationMs ?? 1500,
-                    channelName: request?.ChannelName,
                     ct: ct);
 
                 return Results.Ok(new
@@ -169,10 +118,29 @@ public static class OnboardingEndpoint
                     deviceId = id,
                     deviceName = device.Name,
                     frequencyHz = request?.FrequencyHz ?? 1000,
-                    durationMs = request?.DurationMs ?? 1500,
-                    channelName = request?.ChannelName
+                    durationMs = request?.DurationMs ?? 1500
                 });
-            }, logger, "play test tone", id);
+            }
+            catch (InvalidOperationException ex) when (ex.Message.Contains("already playing"))
+            {
+                return Results.Conflict(new ErrorResponse(false, ex.Message));
+            }
+            catch (TimeoutException ex)
+            {
+                logger.LogWarning(ex, "Test tone playback timed out for device {DeviceId}", id);
+                return Results.Problem(
+                    detail: ex.Message,
+                    statusCode: 504,
+                    title: "Test tone playback timed out");
+            }
+            catch (Exception ex)
+            {
+                logger.LogError(ex, "Failed to play test tone on device {DeviceId}", id);
+                return Results.Problem(
+                    detail: ex.Message,
+                    statusCode: 500,
+                    title: "Failed to play test tone");
+            }
         })
         .WithTags("Devices", "Onboarding")
         .WithName("PlayTestTone")
@@ -183,6 +151,7 @@ public static class OnboardingEndpoint
         app.MapPost("/api/onboarding/create-players", async (
             BatchCreatePlayersRequest request,
             PlayerManagerService playerManager,
+            ConfigurationService config,
             ILoggerFactory loggerFactory,
             CancellationToken ct) =>
         {
@@ -194,21 +163,98 @@ public static class OnboardingEndpoint
                 return Results.BadRequest(new ErrorResponse(false, "No players specified"));
             }
 
-            var result = await playerManager.BatchCreatePlayersAsync(request.Players, ct);
+            var created = new List<string>();
+            var started = new List<string>();
+            var failed = new List<object>();
 
-            // Transform failed list to match existing API contract (anonymous objects with name/error)
-            var failed = result.Failed.Select(f => new { name = f.Name, error = f.Error }).ToList();
+            foreach (var playerReq in request.Players)
+            {
+                try
+                {
+                    if (string.IsNullOrWhiteSpace(playerReq.Name))
+                    {
+                        failed.Add(new { name = playerReq.Name ?? "(empty)", error = "Player name is required" });
+                        continue;
+                    }
+
+                    // Validate player name format (alphanumeric, spaces, hyphens, underscores only)
+                    if (!PlayerManagerService.ValidatePlayerName(playerReq.Name, out var nameError))
+                    {
+                        failed.Add(new { name = playerReq.Name, error = nameError });
+                        continue;
+                    }
+
+                    if (config.PlayerExists(playerReq.Name))
+                    {
+                        failed.Add(new { name = playerReq.Name, error = "Player already exists" });
+                        continue;
+                    }
+
+                    // Create player configuration
+                    var playerConfig = new PlayerConfiguration
+                    {
+                        Name = playerReq.Name,
+                        Device = playerReq.Device ?? string.Empty,
+                        Volume = playerReq.Volume ?? 75,
+                        Autostart = playerReq.Autostart ?? true,
+                        Provider = "sendspin"
+                    };
+
+                    config.SetPlayer(playerReq.Name, playerConfig);
+                    created.Add(playerReq.Name);
+
+                    logger.LogInformation("Created player from onboarding: {PlayerName}", playerReq.Name);
+                }
+                catch (Exception ex)
+                {
+                    logger.LogError(ex, "Failed to create player {PlayerName}", playerReq.Name);
+                    failed.Add(new { name = playerReq.Name, error = ex.Message });
+                }
+            }
+
+            // Save all at once
+            if (created.Count > 0)
+            {
+                config.Save();
+            }
+
+            // Start each created player (autostart won't trigger since app already running)
+            foreach (var playerName in created)
+            {
+                try
+                {
+                    var playerConfig = config.GetPlayer(playerName);
+                    if (playerConfig == null)
+                        continue;
+
+                    var createRequest = new PlayerCreateRequest
+                    {
+                        Name = playerName,
+                        Device = playerConfig.Device,
+                        Volume = playerConfig.Volume ?? 75
+                    };
+
+                    await playerManager.CreatePlayerAsync(createRequest, ct);
+                    started.Add(playerName);
+                    logger.LogInformation("Started player from onboarding: {PlayerName}", playerName);
+                }
+                catch (Exception ex)
+                {
+                    logger.LogWarning(ex, "Failed to start player {PlayerName} (config saved, will start on restart)", playerName);
+                    // Don't add to failed - the player was created, just not started
+                }
+            }
 
             return Results.Ok(new
             {
-                success = result.Success,
-                message = $"Created {result.CreatedCount} of {request.Players.Count} players, started {result.StartedCount}",
-                created = result.Created,
-                started = result.Started,
+                success = failed.Count == 0,
+                message = $"Created {created.Count} of {request.Players.Count} players, started {started.Count}",
+                created,
+                started,
                 failed,
-                createdCount = result.CreatedCount,
-                startedCount = result.StartedCount,
-                failedCount = result.FailedCount
+                createdCount = created.Count,
+                startedCount = started.Count,
+                failedCount = failed.Count
             });
         })
         .WithTags("Onboarding")
@@ -226,12 +272,18 @@ public record OnboardingCompleteRequest(int DevicesConfigured = 0, int PlayersCr
 /// <summary>
 /// Request to play a test tone.
 /// </summary>
-/// <param name="FrequencyHz">Tone frequency in Hz (20-20000). Default: 1000Hz.</param>
-/// <param name="DurationMs">Tone duration in milliseconds (100-10000). Default: 1500ms.</param>
-/// <param name="ChannelName">Optional channel name for multi-channel devices.</param>
-public record TestToneRequest(
-    [property: Range(20, 20000, ErrorMessage = "FrequencyHz must be between 20 and 20000.")]
-    int? FrequencyHz = null,
-    [property: Range(100, 10000, ErrorMessage = "DurationMs must be between 100 and 10000.")]
-    int? DurationMs = null,
-    string? ChannelName = null);
+public record TestToneRequest(int? FrequencyHz = null, int? DurationMs = null);
+
+/// <summary>
+/// Request for batch player creation.
+/// </summary>
+public record BatchCreatePlayersRequest(List<BatchPlayerRequest>? Players);
+
+/// <summary>
+/// Single player creation request.
+/// </summary>
+public record BatchPlayerRequest(
+    string Name,
+    string? Device = null,
+    int? Volume = null,
+    bool? Autostart = null);

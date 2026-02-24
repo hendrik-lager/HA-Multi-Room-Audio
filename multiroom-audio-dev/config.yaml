@@ -1,5 +1,5 @@
 name: Multi-Room Audio (Dev)
-version: "sha-f07c6b3"
+version: "sha-996577d"
 slug: multiroom-audio-dev
 description: >-
   Development builds - may be unstable. Sendspin-powered multi-room audio
@@ -13,19 +13,17 @@ arch:
 
 # Hardware access
 audio: true
+full_access: true
 host_network: true
 udev: true
-uart: true
-usb: true
-# Explicit device mapping for audio access
+# TODO: Remove if full_access: true is sufficient for audio access
 devices:
   - "/dev/snd:/dev/snd"
-  - "/proc/asound:/host/asound:ro"
 
 # Permissions for audio processing
 privileged:
   - SYS_NICE
-apparmor: true
+apparmor: false
 
 # Storage mapping
 map:
@@ -41,18 +39,9 @@ panel_title: Multi-Room Audio (Dev)
 # User-configurable options
 options:
   log_level: info
-  relay_serial_port: null
-  relay_devices: []
-  mock_hardware: false
-  enable_advanced_formats: false
 
 schema:
   log_level: list(debug|info|warning|error)
-  relay_serial_port: device(subsystem=tty)?
-  relay_devices:
-    - str?
-  mock_hardware: bool?
-  enable_advanced_formats: bool?
 
 # Watchdog - auto-restart if health check fails
 watchdog: http://[HOST]:[PORT:8096]/api/health

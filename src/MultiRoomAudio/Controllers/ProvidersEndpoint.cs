@@ -7,16 +7,6 @@ namespace MultiRoomAudio.Controllers;
 /// </summary>
 public static class ProvidersEndpoint
 {
-    /// <summary>
-    /// Registers provider information API endpoints with the application.
-    /// </summary>
-    /// <remarks>
-    /// Endpoints:
-    /// <list type="bullet">
-    /// <item>GET /api/providers - List available audio player providers</item>
-    /// </list>
-    /// </remarks>
-    /// <param name="app">The WebApplication to register endpoints on.</param>
     public static void MapProvidersEndpoints(this WebApplication app)
     {
         var group = app.MapGroup("/api/providers")
@@ -24,7 +14,6 @@ public static class ProvidersEndpoint
             .WithOpenApi();
 
         // GET /api/providers - List available providers
-        // NOTE: Not called by UI - reserved for future multi-provider support
         group.MapGet("/", () =>
         {
             // Sendspin-only implementation

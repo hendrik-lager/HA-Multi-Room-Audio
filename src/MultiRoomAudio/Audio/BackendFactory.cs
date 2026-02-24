@@ -1,4 +1,3 @@
-using MultiRoomAudio.Audio.Mock;
 using MultiRoomAudio.Audio.PulseAudio;
 using MultiRoomAudio.Models;
 using MultiRoomAudio.Services;
@@ -30,27 +29,14 @@ public class BackendFactory
         ILogger<BackendFactory> logger,
         EnvironmentService environment,
         ILoggerFactory loggerFactory,
-        Utilities.VolumeCommandRunner volumeRunner,
-        CustomSinksService? customSinksService = null,
-        MockHardwareConfigService? mockConfigService = null)
+        Utilities.VolumeCommandRunner volumeRunner)
     {
         _logger = logger;
 
-        if (environment.IsMockHardware)
-        {
-            _logger.LogInformation("Initializing mock audio backend (MOCK_HARDWARE mode)");
-            _backend = new MockAudioBackend(
-                loggerFactory.CreateLogger<MockAudioBackend>(),
-                customSinksService,
-                mockConfigService);
-        }
-        else
-        {
-            _logger.LogInformation("Initializing PulseAudio backend");
-            _backend = new PulseAudioBackend(
-                loggerFactory.CreateLogger<PulseAudioBackend>(),
-                volumeRunner);
-        }
+        _logger.LogInformation("Initializing PulseAudio backend");
+        _backend = new PulseAudioBackend(
+            loggerFactory.CreateLogger<PulseAudioBackend>(),
+            volumeRunner);
 
         _logger.LogInformation("Audio backend: {Backend}", _backend.Name);
     }

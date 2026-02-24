@@ -1,5 +1,4 @@
 using MultiRoomAudio.Audio;
-using MultiRoomAudio.Audio.Mock;
 using MultiRoomAudio.Audio.PulseAudio;
 using MultiRoomAudio.Models;
 using MultiRoomAudio.Utilities;
@@ -12,7 +11,7 @@ namespace MultiRoomAudio.Services;
 /// Manages PulseAudio card profile selections with persistence.
 /// Implements IHostedService to restore saved profiles on startup.
 /// </summary>
-public class CardProfileService
+public class CardProfileService : IHostedService
 {
     private readonly ILogger<CardProfileService> _logger;
     private readonly EnvironmentService _environment;
@@ -22,7 +21,7 @@ public class CardProfileService
     private readonly string _configPath;
     private readonly IDeserializer _deserializer;
     private readonly ISerializer _serializer;
-    private readonly ReaderWriterLockSlim _configLock = new(LockRecursionPolicy.NoRecursion);
+    private readonly object _configLock = new();
 
     public CardProfileService(
         ILogger<CardProfileService> logger,
@@ -54,16 +53,13 @@ public class CardProfileService
 
     /// <summary>
     /// Restore saved card profiles on startup.
-    /// Called by StartupOrchestrator during background initialization.
     /// </summary>
-    public async Task InitializeAsync(CancellationToken cancellationToken)
+    public async Task StartAsync(CancellationToken cancellationToken)
     {
         _logger.LogInformation("CardProfileService starting...");
 
         // Always enumerate cards to log what's available
-        var cards = _environment.IsMockHardware
-            ? MockCardEnumerator.GetCards().ToList()
-            : PulseAudioCardEnumerator.GetCards().ToList();
+        var cards = PulseAudioCardEnumerator.GetCards().ToList();
 
         if (cards.Count == 0)
         {
@@ -85,58 +81,39 @@ public class CardProfileService
             }
         }
 
-        // IMPORTANT: Load and migrate profiles BEFORE tracking cards
-        // Otherwise EnsureCardTracked would save current (potentially wrong) profiles
-        // before migration can map old configs to their new stable keys
         var savedProfiles = LoadConfigurations();
 
         if (savedProfiles.Count == 0)
         {
             _logger.LogInformation("No saved card profiles to restore");
-
-            // Only track cards as new if there were no saved profiles
-            foreach (var card in cards)
-            {
-                EnsureCardTracked(card);
-            }
             return;
         }
-
-        // Migrate old-format keys and build lookup by new key format
-        var migratedProfiles = MigrateAndBuildLookup(savedProfiles, cards);
-
-        // Now track any truly new cards (cards that weren't found in migrated profiles)
-        foreach (var card in cards)
-        {
-            var stableKey = ConfigurationService.GenerateCardKey(card);
-            if (!migratedProfiles.ContainsKey(stableKey))
-            {
-                EnsureCardTracked(card);
-            }
-        }
-
         var restoredCount = 0;
         var failedCount = 0;
 
-        // Now restore profiles for each current card
-        foreach (var card in cards)
+        foreach (var (cardName, config) in savedProfiles)
         {
-            var stableKey = ConfigurationService.GenerateCardKey(card);
-
-            if (!migratedProfiles.TryGetValue(stableKey, out var config))
-            {
-                // No saved config for this card
-                continue;
-            }
-
             try
             {
+                // Find the card
+                var card = cards.FirstOrDefault(c =>
+                    c.Name.Equals(cardName, StringComparison.OrdinalIgnoreCase));
+
+                if (card == null)
+                {
+                    _logger.LogWarning(
+                        "Saved profile for card '{CardName}' could not be restored: card not found",
+                        cardName);
+                    failedCount++;
+                    continue;
+                }
+
                 // Check if already at the desired profile
                 if (card.ActiveProfile.Equals(config.ProfileName, StringComparison.OrdinalIgnoreCase))
                 {
                     _logger.LogDebug(
                         "Card '{CardName}' already at profile '{Profile}'",
-                        card.Name, config.ProfileName);
+                        cardName, config.ProfileName);
                     restoredCount++;
                     await ApplyBootMutePreferenceAsync(card, defaultUnmute: false, logBootAction: true);
                     continue;
@@ -150,7 +127,7 @@ public class CardProfileService
                 {
                     _logger.LogWarning(
                         "Saved profile '{Profile}' for card '{CardName}' not found",
-                        config.ProfileName, card.Name);
+                        config.ProfileName, cardName);
                     failedCount++;
                     continue;
                 }
@@ -159,21 +136,17 @@ public class CardProfileService
                 {
                     _logger.LogWarning(
                         "Saved profile '{Profile}' for card '{CardName}' is not available",
-                        config.ProfileName, card.Name);
+                        config.ProfileName, cardName);
                     failedCount++;
                     continue;
                 }
 
                 // Apply the profile
-                var success = _environment.IsMockHardware
-                    ? MockCardEnumerator.SetCardProfile(card.Name, config.ProfileName, out var error)
-                    : PulseAudioCardEnumerator.SetCardProfile(card.Name, config.ProfileName, out error);
-
-                if (success)
+                if (PulseAudioCardEnumerator.SetCardProfile(card.Name, config.ProfileName, out var error))
                 {
                     _logger.LogInformation(
                         "Restored card '{CardName}' to profile '{Profile}'",
-                        card.Name, config.ProfileName);
+                        cardName, config.ProfileName);
                     restoredCount++;
                     await ApplyBootMutePreferenceAsync(card, defaultUnmute: false, logBootAction: true);
                 }
@@ -181,14 +154,14 @@ public class CardProfileService
                 {
                     _logger.LogWarning(
                         "Failed to restore profile '{Profile}' for card '{CardName}': {Error}",
-                        config.ProfileName, card.Name, error);
+                        config.ProfileName, cardName, error);
                     failedCount++;
                 }
             }
             catch (Exception ex)
             {
                 _logger.LogError(ex,
-                    "Exception restoring profile for card '{CardName}'", card.Name);
+                    "Exception restoring profile for card '{CardName}'", cardName);
                 failedCount++;
             }
         }
@@ -204,31 +177,25 @@ public class CardProfileService
     }
 
     /// <summary>
+    /// No-op on shutdown (profiles persist in PulseAudio until system restart).
+    /// </summary>
+    public Task StopAsync(CancellationToken cancellationToken)
+    {
+        _logger.LogInformation("CardProfileService stopped");
+        return Task.CompletedTask;
+    }
+
+    /// <summary>
     /// Gets all available sound cards with their profiles.
-    /// Also tracks any new cards for persistence (handles hot-plug).
     /// </summary>
     public IEnumerable<PulseAudioCard> GetCards()
     {
-        var cards = _environment.IsMockHardware
-            ? MockCardEnumerator.GetCards().ToList()
-            : PulseAudioCardEnumerator.GetCards().ToList();
-
-        // Track any new cards (handles hot-plug scenarios)
-        foreach (var card in cards)
-        {
-            EnsureCardTracked(card);
-        }
-
+        var cards = PulseAudioCardEnumerator.GetCards().ToList();
         var savedProfiles = LoadConfigurations();
 
         return cards.Select(card =>
         {
-            // Try stable key first, fall back to legacy card.Name for pre-migration reads
-            // (migration runs in background after Kestrel starts, so API calls may arrive first)
-            var stableKey = ConfigurationService.GenerateCardKey(card);
-            var config = savedProfiles.GetValueOrDefault(stableKey)
-                ?? savedProfiles.GetValueOrDefault(card.Name);
-
+            var config = savedProfiles.GetValueOrDefault(card.Name);
             var isMuted = GetCardMuteState(card);
             var bootMuted = config?.BootMuted;
             var bootMatches = bootMuted.HasValue && isMuted.HasValue && bootMuted.Value == isMuted.Value;
@@ -255,13 +222,7 @@ public class CardProfileService
             return null;
         }
 
-        var savedProfiles = LoadConfigurations();
-        // Try stable key first, fall back to legacy card.Name for pre-migration reads
-        // (migration runs in background after Kestrel starts, so API calls may arrive first)
-        var stableKey = ConfigurationService.GenerateCardKey(card);
-        var config = savedProfiles.GetValueOrDefault(stableKey)
-            ?? savedProfiles.GetValueOrDefault(card.Name);
-
+        var config = LoadConfigurations().GetValueOrDefault(card.Name);
         var isMuted = GetCardMuteState(card);
         var bootMuted = config?.BootMuted;
         var bootMatches = bootMuted.HasValue && isMuted.HasValue && bootMuted.Value == isMuted.Value;
@@ -282,9 +243,7 @@ public class CardProfileService
     public async Task<CardProfileResponse> SetCardProfileAsync(string cardNameOrIndex, string profileName)
     {
         // Get current card state before change
-        var card = _environment.IsMockHardware
-            ? MockCardEnumerator.GetCard(cardNameOrIndex)
-            : PulseAudioCardEnumerator.GetCard(cardNameOrIndex);
+        var card = PulseAudioCardEnumerator.GetCard(cardNameOrIndex);
         if (card == null)
         {
             return new CardProfileResponse(
@@ -296,11 +255,7 @@ public class CardProfileService
         var previousProfile = card.ActiveProfile;
 
         // Attempt to change the profile
-        var success = _environment.IsMockHardware
-            ? MockCardEnumerator.SetCardProfile(card.Name, profileName, out var error)
-            : PulseAudioCardEnumerator.SetCardProfile(card.Name, profileName, out error);
-
-        if (!success)
+        if (!PulseAudioCardEnumerator.SetCardProfile(card.Name, profileName, out var error))
         {
             return new CardProfileResponse(
                 Success: false,
@@ -310,8 +265,8 @@ public class CardProfileService
             );
         }
 
-        // Save to persistent config using stable key
-        SaveProfile(card, profileName);
+        // Save to persistent config
+        SaveProfile(card.Name, profileName);
 
         _logger.LogInformation(
             "Changed card '{Card}' profile from '{Previous}' to '{New}'",
@@ -349,36 +304,12 @@ public class CardProfileService
     }
 
     /// <summary>
-    /// Ensures a card is tracked in the configuration.
-    /// Returns true if a NEW card entry was created (not already tracked).
-    /// Tracks the card with its current active profile.
-    /// </summary>
-    public bool EnsureCardTracked(PulseAudioCard card)
-    {
-        var stableKey = ConfigurationService.GenerateCardKey(card);
-        var existingConfigs = LoadConfigurations();
-
-        if (existingConfigs.ContainsKey(stableKey))
-        {
-            // Already tracked
-            return false;
-        }
-
-        // New card - save with current profile
-        _logger.LogInformation("New sound card discovered: {Key} ({CardName})", stableKey, card.Name);
-        SaveProfile(card, card.ActiveProfile);
-        return true;
-    }
-
-    /// <summary>
     /// Removes a saved profile configuration for a card.
     /// </summary>
     public bool RemoveSavedProfile(string cardNameOrIndex)
     {
         // Resolve card name if given an index
-        var card = _environment.IsMockHardware
-            ? MockCardEnumerator.GetCard(cardNameOrIndex)
-            : PulseAudioCardEnumerator.GetCard(cardNameOrIndex);
+        var card = PulseAudioCardEnumerator.GetCard(cardNameOrIndex);
         var cardName = card?.Name ?? cardNameOrIndex;
 
         return RemoveProfile(cardName);
@@ -389,9 +320,7 @@ public class CardProfileService
     /// </summary>
     public async Task<CardMuteResponse> SetCardMuteAsync(string cardNameOrIndex, bool muted)
     {
-        var card = _environment.IsMockHardware
-            ? MockCardEnumerator.GetCard(cardNameOrIndex)
-            : PulseAudioCardEnumerator.GetCard(cardNameOrIndex);
+        var card = PulseAudioCardEnumerator.GetCard(cardNameOrIndex);
         if (card == null)
         {
             return new CardMuteResponse(false, $"Card '{cardNameOrIndex}' not found.");
@@ -404,12 +333,10 @@ public class CardProfileService
             displayName,
             muted ? "muted" : "unmuted");
 
-        var sinks = _environment.IsMockHardware
-            ? MockCardEnumerator.GetSinksByCard(card.Name)
-            : PulseAudioCardEnumerator.GetSinksByCard(card.Name);
+        var sinks = PulseAudioCardEnumerator.GetSinksByCard(card.Index);
         if (sinks.Count == 0)
         {
-            return new CardMuteResponse(false, $"No sinks found for card '{card.Name}'.", CardOperationStatus.Error, card.Name);
+            return new CardMuteResponse(false, $"No sinks found for card '{card.Name}'.", card.Name);
         }
 
         var failed = new List<string>();
@@ -417,16 +344,7 @@ public class CardProfileService
         {
             try
             {
-                bool success;
-                if (_environment.IsMockHardware)
-                {
-                    // Use mock implementation
-                    success = MockCardEnumerator.SetMuteBySink(sinkName, muted);
-                }
-                else
-                {
-                    success = await _volumeRunner.SetMuteAsync(sinkName, muted);
-                }
+                var success = await _volumeRunner.SetMuteAsync(sinkName, muted);
                 if (!success)
                 {
                     failed.Add(sinkName);
@@ -443,7 +361,6 @@ public class CardProfileService
         {
             return new CardMuteResponse(false,
                 $"Failed to set mute for {failed.Count} sink(s): {string.Join(", ", failed)}",
-                CardOperationStatus.Error,
                 card.Name,
                 GetCardMuteState(card));
         }
@@ -457,7 +374,6 @@ public class CardProfileService
 
         return new CardMuteResponse(true,
             muted ? "Card muted." : "Card unmuted.",
-            CardOperationStatus.Success,
             card.Name,
             muted);
     }
@@ -467,22 +383,18 @@ public class CardProfileService
     /// </summary>
     public CardBootMuteResponse SetCardBootMute(string cardNameOrIndex, bool muted)
     {
-        var card = _environment.IsMockHardware
-            ? MockCardEnumerator.GetCard(cardNameOrIndex)
-            : PulseAudioCardEnumerator.GetCard(cardNameOrIndex);
+        var card = PulseAudioCardEnumerator.GetCard(cardNameOrIndex);
         if (card == null)
         {
             return new CardBootMuteResponse(false, $"Card '{cardNameOrIndex}' not found.");
         }
 
         var savedProfiles = LoadConfigurations();
-        // Look up by stable key first, fall back to card.Name for legacy configs
-        var stableKey = ConfigurationService.GenerateCardKey(card);
-        var existing = savedProfiles.GetValueOrDefault(stableKey)
-            ?? savedProfiles.GetValueOrDefault(card.Name);
-        var previousPreference = existing?.BootMuted;
+        var previousPreference = savedProfiles.TryGetValue(card.Name, out var existing)
+            ? existing.BootMuted
+            : null;
 
-        SaveBootMute(card, muted);
+        SaveBootMute(card.Name, card.ActiveProfile, muted);
 
         var displayName = GetCardDisplayName(card);
         var mutedLabel = muted ? "muted" : "unmuted";
@@ -516,18 +428,14 @@ public class CardProfileService
     /// </summary>
     public async Task<CardMaxVolumeResponse> SetCardMaxVolumeAsync(string cardNameOrIndex, int? maxVolume)
     {
-        var card = _environment.IsMockHardware
-            ? MockCardEnumerator.GetCard(cardNameOrIndex)
-            : PulseAudioCardEnumerator.GetCard(cardNameOrIndex);
+        var card = PulseAudioCardEnumerator.GetCard(cardNameOrIndex);
         if (card == null)
         {
             return new CardMaxVolumeResponse(false, $"Card '{cardNameOrIndex}' not found.");
         }
 
         // Get all sinks for this card
-        var sinks = _environment.IsMockHardware
-            ? MockCardEnumerator.GetSinksByCard(card.Name)
-            : PulseAudioCardEnumerator.GetSinksByCard(card.Name);
+        var sinks = PulseAudioCardEnumerator.GetSinksByCard(card.Index);
         if (sinks.Count == 0)
         {
             return new CardMaxVolumeResponse(false, $"No sinks found for card '{card.Name}'.", card.Name);
@@ -541,12 +449,7 @@ public class CardProfileService
         {
             try
             {
-                if (_environment.IsMockHardware)
-                {
-                    // Use mock implementation
-                    MockCardEnumerator.SetMaxVolumeBySink(sinkName, maxVolume);
-                }
-                else if (maxVolume.HasValue)
+                if (maxVolume.HasValue)
                 {
                     await _volumeRunner.SetVolumeAsync(sinkName, maxVolume.Value);
                 }
@@ -587,387 +490,196 @@ public class CardProfileService
 
     private Dictionary<string, CardProfileConfiguration> LoadConfigurations()
     {
-        // Read file content outside the lock to avoid blocking on slow I/O
-        string? yaml = null;
-        bool fileExists;
-
-        try
+        lock (_configLock)
         {
-            fileExists = File.Exists(_configPath);
-            if (fileExists)
-            {
-                yaml = File.ReadAllText(_configPath);
-            }
-        }
-        catch (Exception ex)
-        {
-            _logger.LogError(ex, "Failed to read card profiles configuration from {Path}", _configPath);
-            return new Dictionary<string, CardProfileConfiguration>();
-        }
-
-        // Process the data under a read lock
-        _configLock.EnterReadLock();
-        try
-        {
-            if (!fileExists)
+            if (!File.Exists(_configPath))
             {
                 _logger.LogDebug("Card profiles config not found at {Path}", _configPath);
                 return new Dictionary<string, CardProfileConfiguration>();
             }
 
-            if (string.IsNullOrWhiteSpace(yaml))
-                return new Dictionary<string, CardProfileConfiguration>();
-
-            var dict = _deserializer.Deserialize<Dictionary<string, CardProfileConfiguration>>(yaml);
-            if (dict == null)
-                return new Dictionary<string, CardProfileConfiguration>();
-
-            // Ensure CardName field matches dictionary key
-            foreach (var (name, config) in dict)
+            try
             {
-                config.CardName = name;
-            }
+                var yaml = File.ReadAllText(_configPath);
+                if (string.IsNullOrWhiteSpace(yaml))
+                    return new Dictionary<string, CardProfileConfiguration>();
 
-            _logger.LogDebug("Loaded {Count} saved card profile configurations", dict.Count);
-            return dict;
-        }
-        catch (Exception ex)
-        {
-            _logger.LogError(ex, "Failed to parse card profiles configuration from {Path}", _configPath);
-            return new Dictionary<string, CardProfileConfiguration>();
-        }
-        finally
-        {
-            _configLock.ExitReadLock();
-        }
-    }
+                var dict = _deserializer.Deserialize<Dictionary<string, CardProfileConfiguration>>(yaml);
+                if (dict == null)
+                    return new Dictionary<string, CardProfileConfiguration>();
 
-    /// <summary>
-    /// Migrates old-format keys (card names) to new-format keys (bus path based) and builds a lookup dictionary.
-    /// Old-format keys start with "alsa_card." while new-format keys start with "path_", "serial_", or "usb_".
-    /// </summary>
-    private Dictionary<string, CardProfileConfiguration> MigrateAndBuildLookup(
-        Dictionary<string, CardProfileConfiguration> savedProfiles,
-        List<PulseAudioCard> currentCards)
-    {
-        var result = new Dictionary<string, CardProfileConfiguration>(StringComparer.OrdinalIgnoreCase);
-        var needsSave = false;
-
-        foreach (var (key, config) in savedProfiles)
-        {
-            // Check if this is an old-format key (card name)
-            if (key.StartsWith("alsa_card.", StringComparison.OrdinalIgnoreCase))
-            {
-                // Old format - find matching card by name and generate new key
-                var card = currentCards.FirstOrDefault(c =>
-                    c.Name.Equals(key, StringComparison.OrdinalIgnoreCase) ||
-                    c.Name.Equals(config.CardName, StringComparison.OrdinalIgnoreCase));
-
-                if (card != null)
+                // Ensure CardName field matches dictionary key
+                foreach (var (name, config) in dict)
                 {
-                    var newKey = ConfigurationService.GenerateCardKey(card);
-                    result[newKey] = config;
-                    config.CardName = card.Name; // Update to current name
-                    needsSave = true;
-                    _logger.LogInformation(
-                        "Migrated card profile key '{OldKey}' to '{NewKey}'", key, newKey);
+                    config.CardName = name;
                 }
-                else
-                {
-                    // Card not currently connected - keep old entry for now
-                    result[key] = config;
-                    _logger.LogDebug(
-                        "Kept old-format key '{OldKey}' (card not connected)", key);
-                }
+
+                _logger.LogDebug("Loaded {Count} saved card profile configurations", dict.Count);
+                return dict;
             }
-            else
+            catch (Exception ex)
             {
-                // Already new format
-                result[key] = config;
+                _logger.LogError(ex, "Failed to load card profiles configuration from {Path}", _configPath);
+                return new Dictionary<string, CardProfileConfiguration>();
             }
-        }
-
-        // Save migrated config if any keys were changed
-        if (needsSave)
-        {
-            SaveAllConfigurations(result);
-        }
-
-        return result;
-    }
-
-    /// <summary>
-    /// Saves all configurations to the config file (used for migration).
-    /// </summary>
-    private void SaveAllConfigurations(Dictionary<string, CardProfileConfiguration> configs)
-    {
-        _configLock.EnterWriteLock();
-        try
-        {
-            var yaml = _serializer.Serialize(configs);
-            var dir = Path.GetDirectoryName(_configPath);
-            if (!string.IsNullOrEmpty(dir) && !Directory.Exists(dir))
-            {
-                Directory.CreateDirectory(dir);
-            }
-            File.WriteAllText(_configPath, yaml);
-            _logger.LogInformation("Saved migrated card profiles configuration");
-        }
-        catch (Exception ex)
-        {
-            _logger.LogError(ex, "Failed to save migrated card profiles configuration");
-        }
-        finally
-        {
-            _configLock.ExitWriteLock();
         }
     }
 
-    /// <summary>
-    /// Removes old-format key (card.Name) if it exists during save operations.
-    /// This cleans up legacy keys that weren't converted during migration.
-    /// </summary>
-    private void RemoveOldFormatKeyIfExists(Dictionary<string, CardProfileConfiguration> configs, string cardName, string context)
+    private void SaveProfile(string cardName, string profileName)
     {
-        if (configs.ContainsKey(cardName))
-        {
-            configs.Remove(cardName);
-            _logger.LogDebug("Removed old-format key '{OldKey}' during {Context}", cardName, context);
-        }
-    }
-
-    private void SaveProfile(PulseAudioCard card, string profileName)
-    {
-        var stableKey = ConfigurationService.GenerateCardKey(card);
-
-        // Read existing config file outside the lock
-        string? existingYaml = null;
-        try
-        {
-            if (File.Exists(_configPath))
-            {
-                existingYaml = File.ReadAllText(_configPath);
-            }
-        }
-        catch (Exception ex)
-        {
-            _logger.LogWarning(ex, "Failed to read existing card profiles config");
-        }
-
-        // Process and serialize under write lock
-        string yamlToWrite;
-        _configLock.EnterWriteLock();
-        try
+        lock (_configLock)
         {
             var configs = new Dictionary<string, CardProfileConfiguration>();
 
-            if (!string.IsNullOrWhiteSpace(existingYaml))
+            // Load existing
+            if (File.Exists(_configPath))
             {
                 try
                 {
-                    configs = _deserializer.Deserialize<Dictionary<string, CardProfileConfiguration>>(existingYaml)
-                        ?? new Dictionary<string, CardProfileConfiguration>();
+                    var yaml = File.ReadAllText(_configPath);
+                    if (!string.IsNullOrWhiteSpace(yaml))
+                    {
+                        configs = _deserializer.Deserialize<Dictionary<string, CardProfileConfiguration>>(yaml)
+                            ?? new Dictionary<string, CardProfileConfiguration>();
+                    }
                 }
                 catch (Exception ex)
                 {
-                    _logger.LogWarning(ex, "Failed to parse existing card profiles config, starting fresh");
+                    _logger.LogWarning(ex, "Failed to read existing card profiles config, starting fresh");
                 }
             }
 
-            RemoveOldFormatKeyIfExists(configs, card.Name, "profile save");
-
-            // Add or update using stable key
-            if (configs.TryGetValue(stableKey, out var existing))
+            // Add or update
+            if (configs.TryGetValue(cardName, out var existing))
             {
-                existing.CardName = card.Name;
+                existing.CardName = cardName;
                 existing.ProfileName = profileName;
             }
             else
             {
-                configs[stableKey] = new CardProfileConfiguration
+                configs[cardName] = new CardProfileConfiguration
                 {
-                    CardName = card.Name,
+                    CardName = cardName,
                     ProfileName = profileName
                 };
             }
 
-            yamlToWrite = _serializer.Serialize(configs);
-        }
-        finally
-        {
-            _configLock.ExitWriteLock();
-        }
-
-        // Write file outside the lock
-        try
-        {
-            var dir = Path.GetDirectoryName(_configPath);
-            if (!string.IsNullOrEmpty(dir) && !Directory.Exists(dir))
+            // Save
+            try
             {
-                Directory.CreateDirectory(dir);
-            }
+                // Ensure directory exists
+                var dir = Path.GetDirectoryName(_configPath);
+                if (!string.IsNullOrEmpty(dir) && !Directory.Exists(dir))
+                {
+                    Directory.CreateDirectory(dir);
+                }
 
-            File.WriteAllText(_configPath, yamlToWrite);
-            _logger.LogDebug("Saved card profile configuration for '{CardName}' (key: {Key})", card.Name, stableKey);
-        }
-        catch (Exception ex)
-        {
-            _logger.LogError(ex, "Failed to save card profile configuration");
+                var yaml = _serializer.Serialize(configs);
+                File.WriteAllText(_configPath, yaml);
+                _logger.LogDebug("Saved card profile configuration for '{CardName}'", cardName);
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "Failed to save card profile configuration");
+            }
         }
     }
 
     private bool RemoveProfile(string cardName)
     {
-        // Read existing config file outside the lock
-        string? existingYaml = null;
-        bool fileExists;
-        try
+        lock (_configLock)
         {
-            fileExists = File.Exists(_configPath);
-            if (fileExists)
-            {
-                existingYaml = File.ReadAllText(_configPath);
-            }
-        }
-        catch (Exception ex)
-        {
-            _logger.LogError(ex, "Failed to read card profiles config for removal");
-            return false;
-        }
+            if (!File.Exists(_configPath))
+                return false;
 
-        if (!fileExists || string.IsNullOrWhiteSpace(existingYaml))
-            return false;
-
-        // Process under write lock
-        string? yamlToWrite = null;
-        bool removed;
-        _configLock.EnterWriteLock();
-        try
-        {
-            var configs = _deserializer.Deserialize<Dictionary<string, CardProfileConfiguration>>(existingYaml)
-                ?? new Dictionary<string, CardProfileConfiguration>();
-
-            removed = configs.Remove(cardName);
-            if (removed)
-            {
-                yamlToWrite = _serializer.Serialize(configs);
-            }
-        }
-        catch (Exception ex)
-        {
-            _logger.LogError(ex, "Failed to process removal of saved profile for card '{CardName}'", cardName);
-            return false;
-        }
-        finally
-        {
-            _configLock.ExitWriteLock();
-        }
-
-        // Write file outside the lock if we removed the card
-        if (removed && yamlToWrite != null)
-        {
             try
             {
-                File.WriteAllText(_configPath, yamlToWrite);
-                _logger.LogDebug("Removed saved profile for card '{CardName}'", cardName);
+                var yaml = File.ReadAllText(_configPath);
+                if (string.IsNullOrWhiteSpace(yaml))
+                    return false;
+
+                var configs = _deserializer.Deserialize<Dictionary<string, CardProfileConfiguration>>(yaml)
+                    ?? new Dictionary<string, CardProfileConfiguration>();
+
+                if (configs.Remove(cardName))
+                {
+                    yaml = _serializer.Serialize(configs);
+                    File.WriteAllText(_configPath, yaml);
+                    _logger.LogDebug("Removed saved profile for card '{CardName}'", cardName);
+                    return true;
+                }
+
+                return false;
             }
             catch (Exception ex)
             {
-                _logger.LogError(ex, "Failed to save config after removing profile for card '{CardName}'", cardName);
+                _logger.LogError(ex, "Failed to remove saved profile for card '{CardName}'", cardName);
                 return false;
             }
         }
-
-        return removed;
     }
 
-    private void SaveBootMute(PulseAudioCard card, bool muted)
+    private void SaveBootMute(string cardName, string profileName, bool muted)
     {
-        var stableKey = ConfigurationService.GenerateCardKey(card);
-
-        // Read existing config file outside the lock
-        string? existingYaml = null;
-        try
-        {
-            if (File.Exists(_configPath))
-            {
-                existingYaml = File.ReadAllText(_configPath);
-            }
-        }
-        catch (Exception ex)
-        {
-            _logger.LogWarning(ex, "Failed to read existing card profiles config");
-        }
-
-        // Process and serialize under write lock
-        string yamlToWrite;
-        _configLock.EnterWriteLock();
-        try
+        lock (_configLock)
         {
             var configs = new Dictionary<string, CardProfileConfiguration>();
 
-            if (!string.IsNullOrWhiteSpace(existingYaml))
+            if (File.Exists(_configPath))
             {
                 try
                 {
-                    configs = _deserializer.Deserialize<Dictionary<string, CardProfileConfiguration>>(existingYaml)
-                        ?? new Dictionary<string, CardProfileConfiguration>();
+                    var yaml = File.ReadAllText(_configPath);
+                    if (!string.IsNullOrWhiteSpace(yaml))
+                    {
+                        configs = _deserializer.Deserialize<Dictionary<string, CardProfileConfiguration>>(yaml)
+                            ?? new Dictionary<string, CardProfileConfiguration>();
+                    }
                 }
                 catch (Exception ex)
                 {
-                    _logger.LogWarning(ex, "Failed to parse existing card profiles config, starting fresh");
+                    _logger.LogWarning(ex, "Failed to read existing card profiles config, starting fresh");
                 }
             }
 
-            RemoveOldFormatKeyIfExists(configs, card.Name, "boot mute save");
-
-            // Add or update using stable key
-            if (configs.TryGetValue(stableKey, out var existing))
+            if (configs.TryGetValue(cardName, out var existing))
             {
-                existing.CardName = card.Name;
+                existing.CardName = cardName;
                 existing.BootMuted = muted;
-                existing.ProfileName = card.ActiveProfile;
+                existing.ProfileName = profileName;
             }
             else
             {
-                configs[stableKey] = new CardProfileConfiguration
+                configs[cardName] = new CardProfileConfiguration
                 {
-                    CardName = card.Name,
-                    ProfileName = card.ActiveProfile,
+                    CardName = cardName,
+                    ProfileName = profileName,
                     BootMuted = muted
                 };
             }
 
-            yamlToWrite = _serializer.Serialize(configs);
-        }
-        finally
-        {
-            _configLock.ExitWriteLock();
-        }
-
-        // Write file outside the lock
-        try
-        {
-            var dir = Path.GetDirectoryName(_configPath);
-            if (!string.IsNullOrEmpty(dir) && !Directory.Exists(dir))
+            try
             {
-                Directory.CreateDirectory(dir);
-            }
+                var dir = Path.GetDirectoryName(_configPath);
+                if (!string.IsNullOrEmpty(dir) && !Directory.Exists(dir))
+                {
+                    Directory.CreateDirectory(dir);
+                }
 
-            File.WriteAllText(_configPath, yamlToWrite);
-            _logger.LogDebug("Saved boot mute configuration for '{CardName}' (key: {Key})", card.Name, stableKey);
-        }
-        catch (Exception ex)
-        {
-            _logger.LogError(ex, "Failed to save boot mute configuration");
+                var yaml = _serializer.Serialize(configs);
+                File.WriteAllText(_configPath, yaml);
+                _logger.LogDebug("Saved boot mute configuration for '{CardName}'", cardName);
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "Failed to save boot mute configuration");
+            }
         }
     }
 
     private bool? GetCardMuteState(PulseAudioCard card)
     {
-        var sinks = _environment.IsMockHardware
-            ? MockCardEnumerator.GetSinksByCard(card.Name)
-            : PulseAudioCardEnumerator.GetSinksByCard(card.Name);
+        var sinks = PulseAudioCardEnumerator.GetSinksByCard(card.Index);
         if (sinks.Count == 0)
         {
             return null;
@@ -975,9 +687,7 @@ public class CardProfileService
 
         try
         {
-            var output = _environment.IsMockHardware
-                ? MockCardEnumerator.GetSinksMuteStates()
-                : PulseAudioCardEnumerator.GetSinksMuteStates();
+            var output = PulseAudioCardEnumerator.GetSinksMuteStates();
             if (output.Count == 0)
             {
                 return null;
@@ -1008,9 +718,7 @@ public class CardProfileService
 
     private int? GetCardMaxVolume(PulseAudioCard card)
     {
-        var sinks = _environment.IsMockHardware
-            ? MockCardEnumerator.GetSinksByCard(card.Name)
-            : PulseAudioCardEnumerator.GetSinksByCard(card.Name);
+        var sinks = PulseAudioCardEnumerator.GetSinksByCard(card.Index);
         if (sinks.Count == 0)
         {
             return null;
@@ -1048,16 +756,12 @@ public class CardProfileService
     private async Task ApplyBootMutePreferenceAsync(PulseAudioCard card, bool defaultUnmute, bool logBootAction = false)
     {
         var savedProfiles = LoadConfigurations();
-        // Look up by stable key first, fall back to card.Name for legacy configs
-        var stableKey = ConfigurationService.GenerateCardKey(card);
-        if (!savedProfiles.TryGetValue(stableKey, out var config))
+        if (!savedProfiles.TryGetValue(card.Name, out var config))
         {
-            // Try legacy key (card name) as fallback
-            savedProfiles.TryGetValue(card.Name, out config);
-        }
-        if (config == null && !defaultUnmute)
-        {
-            return;
+            if (!defaultUnmute)
+            {
+                return;
+            }
         }
 
         if (config?.BootMuted == null && !defaultUnmute)
@@ -1066,9 +770,7 @@ public class CardProfileService
         }
 
         var desiredMuted = config?.BootMuted ?? false;
-        var sinks = _environment.IsMockHardware
-            ? MockCardEnumerator.GetSinksByCard(card.Name)
-            : PulseAudioCardEnumerator.GetSinksByCard(card.Name);
+        var sinks = PulseAudioCardEnumerator.GetSinksByCard(card.Index);
         var previousState = logBootAction ? GetCardMuteState(card) : null;
         foreach (var sinkName in sinks)
         {

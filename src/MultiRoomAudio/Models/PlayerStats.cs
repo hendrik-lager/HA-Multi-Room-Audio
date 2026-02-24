@@ -11,15 +11,11 @@ public record PlayerStatsResponse(
     ClockSyncStats ClockSync,
     ThroughputStats Throughput,
     SyncCorrectionStats Correction,
-    BufferDiagnostics Diagnostics,
-    /// <summary>SDK version for debugging.</summary>
-    string SdkVersion = "unknown",
-    /// <summary>Server time matching log timestamps.</summary>
-    string ServerTime = ""
+    BufferDiagnostics Diagnostics
 );
 
 /// <summary>
-/// Audio format information for input, output, and hardware sink.
+/// Audio format information for input and output.
 /// </summary>
 public record AudioFormatStats(
     string InputFormat,
@@ -29,11 +25,7 @@ public record AudioFormatStats(
     string OutputFormat,
     int OutputSampleRate,
     int OutputChannels,
-    int OutputBitDepth,
-    // Hardware sink format (what PulseAudio negotiated with the device)
-    string? HardwareFormat = null,      // e.g., "S32LE", "S24LE", "FLOAT32LE"
-    int? HardwareSampleRate = null,     // Actual sink sample rate
-    int? HardwareBitDepth = null        // Derived bit depth (16, 24, or 32)
+    int OutputBitDepth
 );
 
 /// <summary>
@@ -66,9 +58,7 @@ public record ClockSyncStats(
     bool IsDriftReliable,
     int MeasurementCount,
     int OutputLatencyMs,
-    int StaticDelayMs,
-    /// <summary>Active timing source: "audio-clock", "monotonic", or "wall-clock".</summary>
-    string TimingSource = "unknown"
+    int StaticDelayMs
 );
 
 /// <summary>
@@ -82,7 +72,7 @@ public record ThroughputStats(
 
 /// <summary>
 /// Sync correction statistics.
-/// Uses frame drop/insert when sync error exceeds 15ms threshold.
+/// Uses frame drop/insert when sync error exceeds 5ms threshold.
 /// </summary>
 public record SyncCorrectionStats(
     string Mode,

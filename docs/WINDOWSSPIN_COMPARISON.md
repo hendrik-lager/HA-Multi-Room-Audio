@@ -142,10 +142,13 @@ Both use `KalmanClockSynchronizer` from SDK.
 
 Both use `SyncCorrectionOptions`, but with different tuning:
 
-**MultiRoomAudio** uses `ReadRaw()` and handles sync correction externally in `BufferedAudioSampleSource`:
-- 5ms deadband (no correction for small errors)
-- Frame drop/insert with 3-point weighted interpolation
-- Correction rate scales with error magnitude (10-500 frames between corrections)
+**MultiRoomAudio** (`PulseAudioSyncOptions`):
+```csharp
+EntryDeadbandMicroseconds = 5_000,      // 5ms (vs default 2ms)
+ExitDeadbandMicroseconds = 2_000,       // 2ms (vs default 0.5ms)
+MaxSpeedCorrection = 0.04,              // 4%
+ResamplingThresholdMicroseconds = 200_000,  // 200ms (disable Tier 3)
+```
 
 **windowsSpin**: Uses SDK defaults or similar settings.
 
