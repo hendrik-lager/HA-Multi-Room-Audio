@@ -1,5 +1,5 @@
 name: Multi-Room Audio Controller
-version: "3.0.0"
+version: "4.0.0"
 slug: multiroom-audio
 description: >-
   Sendspin-powered multi-room audio controller. Stream audio from Music
@@ -13,17 +13,19 @@ arch:
 
 # Hardware access
 audio: true
-full_access: true
 host_network: true
 udev: true
-# TODO: Remove if full_access: true is sufficient for audio access
+uart: true
+usb: true
+# Explicit device mapping for audio access
 devices:
   - "/dev/snd:/dev/snd"
+  - "/proc/asound:/host/asound:ro"
 
 # Permissions for audio processing
 privileged:
   - SYS_NICE
-apparmor: false
+apparmor: true
 
 # Storage mapping
 map:
@@ -39,9 +41,14 @@ panel_title: Multi-Room Audio
 # User-configurable options
 options:
   log_level: info
+  relay_serial_port: null
+  relay_devices: []
 
 schema:
   log_level: list(debug|info|warning|error)
+  relay_serial_port: device(subsystem=tty)?
+  relay_devices:
+    - str?
 
 # Watchdog - auto-restart if health check fails
 watchdog: http://[HOST]:[PORT:8096]/api/health

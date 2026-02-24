@@ -1,19 +1,20 @@
 # Multi-Room Audio (Dev)
 
 <!-- VERSION_INFO_START -->
-## Development Build: sha-996577d
+## Development Build: sha-f07c6b3
 
 **Current Dev Build Changes** (recent)
 
-- Merge branch 'dev' of https://github.com/chrisuthe/Multi-SendSpin-Player-Container into dev
-- add back aarch64 to the config so it can get the already building images.
-- Merge branch 'main' into dev
-- Merge pull request #69 from scyto/feature/preserve-volume-across-tracks
-- Fix hardware volume init to always apply volume, not skip
-- Fix UI slider interaction and tooltip issues
-- Add volume grace period to resolve startup volume sync battle
-- Fix tooltip persistence issues by properly disposing old instances
-- Add automatic page reload on backend version change
+- Merge pull request #175 from scyto/dev
+- Fix off-profile detection for Intel HDA combined duplex profiles (#139)
+- Fix race condition in device reconnection causing duplicate restarts (#138)
+- Fix off-profile device detection to ignore IsAvailable flag (#137)
+- Show off-profile cards in device selector (#136)
+- Fix player state for empty device and diagnostics device matching (#135)
+- Merge pull request #173 from scyto/dev
+- Fix diagnostics summary including custom sinks in audio devices (#134)
+- Fix vertical alignment of mute button with slider (#133)
+- Fix duplicate toast messages on server reconnection (#132)
 
 > WARNING: This is a development build. For stable releases, use the stable add-on.
 <!-- VERSION_INFO_END -->
@@ -38,6 +39,18 @@ When reporting issues with dev builds, please include:
 - The commit SHA (visible in the add-on info)
 - Steps to reproduce the issue
 - Expected vs actual behavior
+
+## Configuration
+
+### Options
+
+| Option | Type | Default | Description |
+|--------|------|---------|-------------|
+| `log_level` | string | `info` | Logging verbosity (debug, info, warning, error) |
+| `relay_serial_port` | device | null | Serial port for Modbus/CH340 relay board |
+| `relay_devices` | list | `[]` | Device paths for HID/FTDI relay boards |
+| `mock_hardware` | bool | `false` | Enable mock audio devices and relay boards for testing without hardware |
+| `enable_advanced_formats` | bool | `false` | Show format selection UI (players default to flac-48000 regardless) |
 
 ## For Stable Release
 
