@@ -1,0 +1,6 @@
+configuration:
+  log_level:
+    name: Log Level
+    description: >-
+      Set the logging verbosity for the add-on.
+      Debug provides the most detail for troubleshooting.

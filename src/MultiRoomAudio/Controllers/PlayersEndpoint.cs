@@ -1,0 +1,550 @@
+using MultiRoomAudio.Models;
+using MultiRoomAudio.Services;
+
+namespace MultiRoomAudio.Controllers;
+
+/// <summary>
+/// REST API endpoints for player management.
+/// </summary>
+public static class PlayersEndpoint
+{
+    #region Helper Methods
+
+    /// <summary>
+    /// Creates a standardized NotFound response for missing players.
+    /// Centralizes error message formatting to avoid duplication.
+    /// </summary>
+    private static IResult PlayerNotFoundResult(string name, ILogger logger, string action)
+    {
+        logger.LogDebug("API: Player {PlayerName} not found for {Action}", name, action);
+        return Results.NotFound(new ErrorResponse(false, $"Player '{name}' not found"));
+    }
+
+    #endregion
+
+    public static void MapPlayersEndpoints(this WebApplication app)
+    {
+        var group = app.MapGroup("/api/players")
+            .WithTags("Players")
+            .WithOpenApi();
+
+        // GET /api/players - List all players
+        group.MapGet("/", (PlayerManagerService manager, ILogger<PlayerManagerService> logger) =>
+        {
+            logger.LogDebug("API: GET /api/players");
+            var response = manager.GetAllPlayers();
+            logger.LogDebug("API: Returning {PlayerCount} players", response.Count);
+            return Results.Ok(response);
+        })
+        .WithName("ListPlayers")
+        .WithDescription("Get all active players");
+
+        // GET /api/players/{name} - Get specific player
+        group.MapGet("/{name}", (string name, PlayerManagerService manager, ILogger<PlayerManagerService> logger) =>
+        {
+            logger.LogDebug("API: GET /api/players/{PlayerName}", name);
+            var player = manager.GetPlayer(name);
+            if (player == null)
+                return PlayerNotFoundResult(name, logger, "get");
+
+            return Results.Ok(player);
+        })
+        .WithName("GetPlayer")
+        .WithDescription("Get details of a specific player");
+
+        // GET /api/players/{name}/stats - Get real-time player stats (Stats for Nerds)
+        group.MapGet("/{name}/stats", (string name, PlayerManagerService manager, ILogger<PlayerManagerService> logger) =>
+        {
+            logger.LogDebug("API: GET /api/players/{PlayerName}/stats", name);
+            var stats = manager.GetPlayerStats(name);
+            if (stats == null)
+                return PlayerNotFoundResult(name, logger, "stats");
+
+            return Results.Ok(stats);
+        })
+        .WithName("GetPlayerStats")
+        .WithDescription("Get real-time audio diagnostics and sync metrics (Stats for Nerds)");
+
+        // POST /api/players - Create new player
+        group.MapPost("/", async (
+            PlayerCreateRequest request,
+            PlayerManagerService manager,
+            ILogger<PlayerManagerService> logger,
+            CancellationToken ct) =>
+        {
+            logger.LogDebug("API: POST /api/players - Creating player {PlayerName}", request.Name);
+            try
+            {
+                var player = await manager.CreatePlayerAsync(request, ct);
+                logger.LogInformation("API: Player {PlayerName} created successfully", player.Name);
+                return Results.Created($"/api/players/{player.Name}", player);
+            }
+            catch (InvalidOperationException ex) when (ex.Message.Contains("already exists"))
+            {
+                logger.LogWarning("API: Player creation conflict - {Message}", ex.Message);
+                return Results.Conflict(new ErrorResponse(false, ex.Message));
+            }
+            catch (ArgumentException ex)
+            {
+                logger.LogWarning("API: Player creation bad request - {Message}", ex.Message);
+                return Results.BadRequest(new ErrorResponse(false, ex.Message));
+            }
+            catch (Exception ex)
+            {
+                logger.LogError(ex, "API: Failed to create player {PlayerName}", request.Name);
+                return Results.Problem(
+                    detail: ex.Message,
+                    statusCode: 500,
+                    title: "Failed to create player");
+            }
+        })
+        .WithName("CreatePlayer")
+        .WithDescription("Create and start a new player");
+
+        // DELETE /api/players/{name} - Stop and remove player (and config)
+        group.MapDelete("/{name}", async (
+            string name,
+            PlayerManagerService manager,
+            ILogger<PlayerManagerService> logger) =>
+        {
+            logger.LogDebug("API: DELETE /api/players/{PlayerName}", name);
+            var deleted = await manager.DeletePlayerAsync(name);
+            if (!deleted)
+                return PlayerNotFoundResult(name, logger, "deletion");
+
+            logger.LogInformation("API: Player {PlayerName} deleted successfully", name);
+            return Results.Ok(new SuccessResponse(true, $"Player '{name}' deleted"));
+        })
+        .WithName("DeletePlayer")
+        .WithDescription("Stop and remove a player (also removes from config)");
+
+        // POST /api/players/{name}/stop - Stop player (keeps config)
+        group.MapPost("/{name}/stop", async (
+            string name,
+            PlayerManagerService manager,
+            ILogger<PlayerManagerService> logger) =>
+        {
+            logger.LogDebug("API: POST /api/players/{PlayerName}/stop", name);
+            var stopped = await manager.StopPlayerAsync(name);
+            if (!stopped)
+                return PlayerNotFoundResult(name, logger, "stop");
+
+            logger.LogInformation("API: Player {PlayerName} stopped successfully", name);
+            return Results.Ok(new SuccessResponse(true, $"Player '{name}' stopped"));
+        })
+        .WithName("StopPlayer")
+        .WithDescription("Stop a player (config preserved for restart)");
+
+        // POST /api/players/{name}/start - Start a stopped player
+        group.MapPost("/{name}/start", async (
+            string name,
+            PlayerManagerService manager,
+            ILogger<PlayerManagerService> logger,
+            CancellationToken ct) =>
+        {
+            logger.LogDebug("API: POST /api/players/{PlayerName}/start", name);
+            try
+            {
+                var player = await manager.StartPlayerAsync(name, ct);
+                if (player == null)
+                    return PlayerNotFoundResult(name, logger, "start");
+
+                logger.LogInformation("API: Player {PlayerName} started successfully", name);
+                return Results.Ok(player);
+            }
+            catch (Exception ex)
+            {
+                logger.LogError(ex, "API: Failed to start player {PlayerName}", name);
+                return Results.Problem(
+                    detail: ex.Message,
+                    statusCode: 500,
+                    title: "Failed to start player");
+            }
+        })
+        .WithName("StartPlayer")
+        .WithDescription("Start a stopped player");
+
+        // POST /api/players/{name}/restart - Restart player
+        group.MapPost("/{name}/restart", async (
+            string name,
+            PlayerManagerService manager,
+            ILogger<PlayerManagerService> logger,
+            CancellationToken ct) =>
+        {
+            logger.LogDebug("API: POST /api/players/{PlayerName}/restart", name);
+            try
+            {
+                var player = await manager.RestartPlayerAsync(name, ct);
+                if (player == null)
+                    return PlayerNotFoundResult(name, logger, "restart");
+
+                logger.LogInformation("API: Player {PlayerName} restarted successfully", name);
+                return Results.Ok(player);
+            }
+            catch (Exception ex)
+            {
+                logger.LogError(ex, "API: Failed to restart player {PlayerName}", name);
+                return Results.Problem(
+                    detail: ex.Message,
+                    statusCode: 500,
+                    title: "Failed to restart player");
+            }
+        })
+        .WithName("RestartPlayer")
+        .WithDescription("Stop and restart a player");
+
+        // PUT /api/players/{name}/device - Switch audio device
+        group.MapPut("/{name}/device", async (
+            string name,
+            DeviceSwitchRequest request,
+            PlayerManagerService manager,
+            ILogger<PlayerManagerService> logger,
+            CancellationToken ct) =>
+        {
+            logger.LogDebug("API: PUT /api/players/{PlayerName}/device to {Device}",
+                name, request.Device ?? "(default)");
+            try
+            {
+                var success = await manager.SwitchDeviceAsync(name, request.Device, ct);
+                if (!success)
+                    return PlayerNotFoundResult(name, logger, "device switch");
+
+                logger.LogInformation("API: Player {PlayerName} switched to device {Device}",
+                    name, request.Device ?? "(default)");
+                return Results.Ok(new SuccessResponse(true, $"Device switched to '{request.Device ?? "default"}'"));
+            }
+            catch (ArgumentException ex)
+            {
+                logger.LogWarning("API: Device switch bad request - {Message}", ex.Message);
+                return Results.BadRequest(new ErrorResponse(false, ex.Message));
+            }
+            catch (Exception ex)
+            {
+                logger.LogError(ex, "API: Failed to switch device for player {PlayerName}", name);
+                return Results.Problem(
+                    detail: ex.Message,
+                    statusCode: 500,
+                    title: "Failed to switch device");
+            }
+        })
+        .WithName("SwitchDevice")
+        .WithDescription("Hot-switch audio device without stopping playback");
+
+        // PUT /api/players/{name}/volume - Set volume
+        group.MapPut("/{name}/volume", async (
+            string name,
+            VolumeRequest request,
+            PlayerManagerService manager,
+            ILogger<PlayerManagerService> logger,
+            CancellationToken ct) =>
+        {
+            logger.LogInformation("VOLUME [API] PUT /api/players/{Name}/volume: {Volume}%", name, request.Volume);
+            try
+            {
+                var success = await manager.SetVolumeAsync(name, request.Volume, ct);
+                if (!success)
+                    return PlayerNotFoundResult(name, logger, "volume change");
+
+                return Results.Ok(new SuccessResponse(true, $"Volume set to {request.Volume}"));
+            }
+            catch (Exception ex)
+            {
+                logger.LogError(ex, "API: Failed to set volume for player {PlayerName}", name);
+                return Results.Problem(
+                    detail: ex.Message,
+                    statusCode: 500,
+                    title: "Failed to set volume");
+            }
+        })
+        .WithName("SetVolume")
+        .WithDescription("Set player volume (0-100)");
+
+        // PUT /api/players/{name}/startup-volume - Set startup volume
+        group.MapPut("/{name}/startup-volume", async (
+            string name,
+            VolumeRequest request,
+            PlayerManagerService manager,
+            ConfigurationService config,
+            ILogger<PlayerManagerService> logger,
+            CancellationToken ct) =>
+        {
+            logger.LogInformation("VOLUME [API] PUT /api/players/{Name}/startup-volume: {Volume}%", name, request.Volume);
+            try
+            {
+                // Update persisted config only
+                if (!config.Players.TryGetValue(name, out var playerConfig))
+                    return PlayerNotFoundResult(name, logger, "set startup volume");
+
+                playerConfig.Volume = Math.Clamp(request.Volume, 0, 100);
+                config.Save();
+
+                logger.LogInformation("VOLUME [StartupConfig] Player '{Name}': startup volume set to {Volume}%",
+                    name, request.Volume);
+
+                return Results.Ok(new SuccessResponse(true,
+                    $"Startup volume set to {request.Volume}% (takes effect on next restart)"));
+            }
+            catch (Exception ex)
+            {
+                logger.LogError(ex, "API: Failed to set startup volume for player {PlayerName}", name);
+                return Results.Problem(
+                    detail: ex.Message,
+                    statusCode: 500,
+                    title: "Failed to set startup volume");
+            }
+        })
+        .WithName("SetStartupVolume")
+        .WithDescription("Set player startup volume (0-100) - takes effect on restart");
+
+        // PUT /api/players/{name}/mute - Set mute state
+        group.MapPut("/{name}/mute", (
+            string name,
+            MuteRequest request,
+            PlayerManagerService manager,
+            ILogger<PlayerManagerService> logger) =>
+        {
+            logger.LogDebug("API: PUT /api/players/{PlayerName}/mute to {Muted}", name, request.Muted);
+            var success = manager.SetMuted(name, request.Muted);
+            if (!success)
+                return PlayerNotFoundResult(name, logger, "mute change");
+
+            return Results.Ok(new SuccessResponse(true, request.Muted ? "Muted" : "Unmuted"));
+        })
+        .WithName("SetMute")
+        .WithDescription("Mute or unmute player");
+
+        // PUT /api/players/{name}/offset - Set delay offset
+        group.MapPut("/{name}/offset", (
+            string name,
+            OffsetRequest request,
+            PlayerManagerService manager,
+            ConfigurationService config,
+            ILogger<PlayerManagerService> logger) =>
+        {
+            logger.LogDebug("API: PUT /api/players/{PlayerName}/offset to {DelayMs}ms", name, request.DelayMs);
+
+            // Apply to running player (affects clock sync timing immediately)
+            if (!manager.SetDelayOffset(name, request.DelayMs))
+                return PlayerNotFoundResult(name, logger, "offset change");
+
+            // Also persist to config so it survives restarts
+            config.UpdatePlayerField(name, c => c.DelayMs = request.DelayMs);
+
+            return Results.Ok(new SuccessResponse(true, $"Offset set to {request.DelayMs}ms"));
+        })
+        .WithName("SetOffset")
+        .WithDescription("Set player delay offset in milliseconds");
+
+        // POST /api/players/{name}/pause - Pause playback
+        group.MapPost("/{name}/pause", (
+            string name,
+            PlayerManagerService manager,
+            ILogger<PlayerManagerService> logger) =>
+        {
+            logger.LogDebug("API: POST /api/players/{PlayerName}/pause", name);
+            try
+            {
+                var player = manager.GetPlayer(name);
+                if (player == null)
+                    return PlayerNotFoundResult(name, logger, "pause");
+
+                manager.PausePlayer(name);
+                return Results.Ok(new SuccessResponse(true, "Playback paused"));
+            }
+            catch (Exception ex)
+            {
+                logger.LogError(ex, "API: Failed to pause player {PlayerName}", name);
+                return Results.Problem(
+                    detail: ex.Message,
+                    statusCode: 500,
+                    title: "Failed to pause player");
+            }
+        })
+        .WithName("PausePlayer")
+        .WithDescription("Pause player playback");
+
+        // POST /api/players/{name}/resume - Resume playback
+        group.MapPost("/{name}/resume", (
+            string name,
+            PlayerManagerService manager,
+            ILogger<PlayerManagerService> logger) =>
+        {
+            logger.LogDebug("API: POST /api/players/{PlayerName}/resume", name);
+            try
+            {
+                var player = manager.GetPlayer(name);
+                if (player == null)
+                    return PlayerNotFoundResult(name, logger, "resume");
+
+                manager.ResumePlayer(name);
+                return Results.Ok(new SuccessResponse(true, "Playback resumed"));
+            }
+            catch (Exception ex)
+            {
+                logger.LogError(ex, "API: Failed to resume player {PlayerName}", name);
+                return Results.Problem(
+                    detail: ex.Message,
+                    statusCode: 500,
+                    title: "Failed to resume player");
+            }
+        })
+        .WithName("ResumePlayer")
+        .WithDescription("Resume player playback");
+
+        // PUT /api/players/{name} - Update player configuration
+        group.MapPut("/{name}", async (
+            string name,
+            PlayerUpdateRequest request,
+            PlayerManagerService manager,
+            ConfigurationService config,
+            ILogger<PlayerManagerService> logger,
+            CancellationToken ct) =>
+        {
+            logger.LogDebug("API: PUT /api/players/{PlayerName}", name);
+
+            // Check player exists
+            var player = manager.GetPlayer(name);
+            if (player == null)
+                return PlayerNotFoundResult(name, logger, "update");
+
+            try
+            {
+                var needsRestart = false;
+                var currentName = name;
+
+                // Handle rename first (affects subsequent operations)
+                // Note: Rename requires restart for the name to appear in Music Assistant
+                // because the SDK's ClientName is set at player creation time
+                if (!string.IsNullOrEmpty(request.Name) && request.Name != name)
+                {
+                    var renamed = manager.RenamePlayer(name, request.Name);
+                    if (!renamed)
+                        return Results.Conflict(new ErrorResponse(false, $"Player '{request.Name}' already exists"));
+                    currentName = request.Name;
+                    needsRestart = true; // Name change requires restart for MA sync
+                    logger.LogInformation("API: Player renamed from {OldName} to {NewName}", name, request.Name);
+                }
+
+                // Apply live changes - check return values to detect if player disappeared
+                if (request.Volume.HasValue)
+                {
+                    var volumeSet = await manager.SetVolumeAsync(currentName, request.Volume.Value, ct);
+                    if (!volumeSet)
+                    {
+                        logger.LogWarning("API: Player '{PlayerName}' disappeared during update (volume)", currentName);
+                        return Results.Problem(
+                            detail: $"Player '{currentName}' was removed during update",
+                            statusCode: 409,
+                            title: "Update conflict");
+                    }
+                }
+
+                if (request.Device != null)
+                {
+                    var deviceSet = await manager.SwitchDeviceAsync(currentName, request.Device == "" ? null : request.Device, ct);
+                    if (!deviceSet)
+                    {
+                        logger.LogWarning("API: Player '{PlayerName}' disappeared during update (device)", currentName);
+                        return Results.Problem(
+                            detail: $"Player '{currentName}' was removed during update",
+                            statusCode: 409,
+                            title: "Update conflict");
+                    }
+                }
+
+                // Update config for changes that require restart
+                var savedConfig = config.GetPlayer(currentName);
+                if (savedConfig != null)
+                {
+                    if (request.ServerUrl != null && request.ServerUrl != (savedConfig.Server ?? ""))
+                    {
+                        savedConfig.Server = request.ServerUrl == "" ? null : request.ServerUrl;
+                        needsRestart = true;
+                    }
+
+                    config.Save();
+                }
+
+                // Return response indicating if restart is needed
+                return Results.Ok(new
+                {
+                    success = true,
+                    message = needsRestart
+                        ? "Configuration updated. Restart required for changes to take effect."
+                        : "Player updated successfully.",
+                    needsRestart,
+                    playerName = currentName
+                });
+            }
+            catch (InvalidOperationException ex) when (ex.Message.Contains("already exists"))
+            {
+                logger.LogWarning("API: Player update conflict - {Message}", ex.Message);
+                return Results.Conflict(new ErrorResponse(false, ex.Message));
+            }
+            catch (ArgumentException ex)
+            {
+                logger.LogWarning("API: Player update bad request - {Message}", ex.Message);
+                return Results.BadRequest(new ErrorResponse(false, ex.Message));
+            }
+            catch (Exception ex)
+            {
+                logger.LogError(ex, "API: Failed to update player {PlayerName}", name);
+                return Results.Problem(
+                    detail: ex.Message,
+                    statusCode: 500,
+                    title: "Failed to update player");
+            }
+        })
+        .WithName("UpdatePlayer")
+        .WithDescription("Update player configuration. Returns whether restart is needed for changes to take effect.");
+
+        // PUT /api/players/{name}/rename - Rename a player
+        group.MapPut("/{name}/rename", (
+            string name,
+            RenameRequest request,
+            PlayerManagerService manager,
+            ILogger<PlayerManagerService> logger) =>
+        {
+            logger.LogDebug("API: PUT /api/players/{PlayerName}/rename to {NewName}", name, request.NewName);
+            try
+            {
+                var success = manager.RenamePlayer(name, request.NewName);
+                if (!success)
+                    return PlayerNotFoundResult(name, logger, "rename");
+
+                logger.LogInformation("API: Player {PlayerName} renamed to {NewName}", name, request.NewName);
+
+                // Return response with restart hint - the name change is saved locally
+                // but the SDK's ClientName is set at creation time, so Music Assistant
+                // will still see the old name until the player is restarted
+                return Results.Ok(new PlayerRenameResponse(
+                    Success: true,
+                    Message: $"Player renamed to '{request.NewName}'",
+                    NewName: request.NewName,
+                    RestartRequired: true,
+                    RestartHint: "Restart the player for the name change to appear in Music Assistant."
+                ));
+            }
+            catch (InvalidOperationException ex) when (ex.Message.Contains("already exists"))
+            {
+                logger.LogWarning("API: Player rename conflict - {Message}", ex.Message);
+                return Results.Conflict(new ErrorResponse(false, ex.Message));
+            }
+            catch (ArgumentException ex)
+            {
+                logger.LogWarning("API: Player rename bad request - {Message}", ex.Message);
+                return Results.BadRequest(new ErrorResponse(false, ex.Message));
+            }
+            catch (Exception ex)
+            {
+                logger.LogError(ex, "API: Failed to rename player {PlayerName}", name);
+                return Results.Problem(
+                    detail: ex.Message,
+                    statusCode: 500,
+                    title: "Failed to rename player");
+            }
+        })
+        .WithName("RenamePlayer")
+        .WithDescription("Rename a player to a new name. Note: Restart the player for the name change to appear in Music Assistant.");
+    }
+}

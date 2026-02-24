@@ -1,0 +1,52 @@
+# Example Player Configuration
+# This file shows the structure of a typical players.yaml configuration file
+# The actual file will be generated automatically when you create players through the web interface
+
+# Example configuration with two Sendspin players:
+
+Kitchen:
+  name: Kitchen
+  clientId: "a1b2c3d4e5f6"    # Auto-generated unique ID
+  deviceId: "0"               # PortAudio device index
+  serverUrl: ""               # Empty for auto-discovery
+  delayMs: 0                  # Audio delay offset in milliseconds
+  logLevel: INFO
+  codec: opus
+  bufferSizeMs: 100
+  volume: 75
+  isMuted: false
+
+Bedroom:
+  name: Bedroom
+  clientId: "f6e5d4c3b2a1"
+  deviceId: "1"
+  serverUrl: ""
+  delayMs: 50                 # Positive delay if this room is ahead
+  logLevel: INFO
+  codec: opus
+  bufferSizeMs: 100
+  volume: 80
+  isMuted: false
+
+# Configuration field explanations:
+#
+# name: Display name for the player (must be unique)
+# clientId: Unique identifier for Sendspin protocol (auto-generated)
+# deviceId: PortAudio device index (use web UI to see available devices)
+#   - "0", "1", "2" etc. for PortAudio device indices
+#   - "null" for testing without audio hardware
+# serverUrl: Music Assistant server URL (empty for auto-discovery via mDNS)
+# delayMs: Audio delay offset in milliseconds for multi-room sync
+#   - Positive values delay audio (use if this room is ahead)
+#   - Negative values advance audio (use if this room is behind)
+# logLevel: Logging verbosity (DEBUG, INFO, WARNING, ERROR)
+# codec: Audio codec (opus recommended)
+# bufferSizeMs: Audio buffer size in milliseconds
+# volume: Default volume level (0-100)
+# isMuted: Whether the player is muted
+
+# Notes:
+# - Each player needs a unique name and clientId
+# - Use the web interface at http://localhost:8096 to create players
+# - Device indices are shown in the web interface device dropdown
+# - Players are automatically started on container restart if they were running

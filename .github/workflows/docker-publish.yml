@@ -1,0 +1,525 @@
+name: Build and Push Docker Images
+
+on:
+  push:
+    branches:
+      - main
+      - dev
+    tags:
+      - 'v*'
+    paths-ignore:
+      - '.github/**'
+  workflow_dispatch:
+
+env:
+  DOCKERHUB_IMAGE: ${{ github.repository_owner }}/squeezelitemultiroom
+  GHCR_IMAGE: ghcr.io/${{ github.repository_owner }}/multiroom-audio
+  HASSIO_IMAGE: ghcr.io/${{ github.repository_owner }}/multiroom-audio-hassio
+  HASSIO_DEV_IMAGE: ghcr.io/${{ github.repository_owner }}/multiroom-audio-hassio-dev
+
+jobs:
+  # ==========================================================================
+  # Build and Test .NET Application
+  # ==========================================================================
+  build-test:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+
+      - name: Set up .NET 8.0
+        uses: actions/setup-dotnet@v5
+        with:
+          dotnet-version: '8.0.x'
+
+      - name: Restore dependencies
+        run: dotnet restore src/MultiRoomAudio/MultiRoomAudio.csproj
+
+      - name: Build
+        run: dotnet build src/MultiRoomAudio/MultiRoomAudio.csproj --no-restore -c Release
+
+  # ==========================================================================
+  # Registry Logins
+  # ==========================================================================
+  login-dockerhub:
+    needs: build-test
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    outputs:
+      logged_in: ${{ steps.login_result.outputs.logged_in }}
+    steps:
+      - name: Login to Docker Hub
+        id: login
+        continue-on-error: true
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Record Docker Hub login result
+        id: login_result
+        run: echo "logged_in=${{ steps.login.outcome == 'success' }}" >> $GITHUB_OUTPUT
+
+      - name: Mark login failure (non-blocking)
+        if: steps.login.outcome != 'success'
+        run: exit 1
+
+  login-ghcr:
+    needs: build-test
+    runs-on: ubuntu-latest
+    permissions:
+      packages: write
+    outputs:
+      logged_in: ${{ steps.login_result.outputs.logged_in }}
+    steps:
+      - name: Login to GitHub Container Registry
+        id: login
+        continue-on-error: true
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Record GHCR login result
+        id: login_result
+        run: echo "logged_in=${{ steps.login.outcome == 'success' }}" >> $GITHUB_OUTPUT
+
+  # ==========================================================================
+  # Build Once
+  # ==========================================================================
+  build-docker:
+    needs: build-test
+    runs-on: ubuntu-latest
+    outputs:
+      build_version: ${{ steps.version.outputs.version }}
+      dockerhub_tags: ${{ steps.tag_lists.outputs.dockerhub_tags }}
+      ghcr_tags: ${{ steps.tag_lists.outputs.ghcr_tags }}
+      hassio_tags: ${{ steps.tag_lists.outputs.hassio_tags }}
+      labels: ${{ steps.meta.outputs.labels }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+
+      - name: Set up QEMU (for multi-arch builds)
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Determine build version
+        id: version
+        run: |
+          if [[ "${{ github.ref }}" == refs/tags/v* ]]; then
+            # Tagged release: use version from tag (strip 'v' prefix)
+            VERSION="${GITHUB_REF#refs/tags/v}"
+          elif [[ "${{ github.ref }}" == "refs/heads/dev" ]]; then
+            # Dev branch: use sha-XXXXXXX format
+            VERSION="sha-$(echo ${{ github.sha }} | cut -c1-7)"
+          else
+            # Main branch or other: use 'latest'
+            VERSION="latest"
+          fi
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
+          echo "Build version: $VERSION"
+
+      - name: Extract metadata (tags, labels)
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: |
+            ${{ env.DOCKERHUB_IMAGE }}
+            ${{ env.GHCR_IMAGE }}
+            ${{ env.HASSIO_IMAGE }}
+          flavor: |
+            latest=false
+          tags: |
+            type=raw,value=latest,enable=${{ github.ref == 'refs/heads/main' }}
+            type=raw,value=dev,enable=${{ github.ref == 'refs/heads/dev' }}
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=semver,pattern={{major}},enable=${{ !startsWith(github.ref, 'refs/tags/v0.') }}
+            type=sha,prefix=sha-,format=short
+
+      - name: Collect registry-specific tags
+        id: tag_lists
+        run: |
+          tag_json='${{ steps.meta.outputs.json }}'
+          dockerhub_tags=$(echo "$tag_json" | jq -r '.tags[] | select(startswith("${{ env.DOCKERHUB_IMAGE }}:"))')
+          ghcr_tags=$(echo "$tag_json" | jq -r '.tags[] | select(startswith("${{ env.GHCR_IMAGE }}:"))')
+          hassio_tags=$(echo "$tag_json" | jq -r '.tags[] | select(startswith("${{ env.HASSIO_IMAGE }}:"))')
+          {
+            echo "dockerhub_tags<<EOF"
+            echo "$dockerhub_tags"
+            echo "EOF"
+            echo "ghcr_tags<<EOF"
+            echo "$ghcr_tags"
+            echo "EOF"
+            echo "hassio_tags<<EOF"
+            echo "$hassio_tags"
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Build image (cache warm)
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: docker/Dockerfile
+          platforms: linux/amd64,linux/arm64
+          push: false
+          outputs: type=cacheonly
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha,scope=docker
+          cache-to: type=gha,mode=max,scope=docker
+          build-args: |
+            BUILD_VERSION=${{ steps.version.outputs.version }}
+            BUILD_DATE=${{ github.event.head_commit.timestamp }}
+            VCS_REF=${{ github.sha }}
+
+  # ==========================================================================
+  # Pushes (registry-specific)
+  # ==========================================================================
+  push-dockerhub:
+    needs:
+      - build-docker
+      - login-dockerhub
+    runs-on: ubuntu-latest
+    if: needs.login-dockerhub.outputs.logged_in == 'true'
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+
+      - name: Login to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Push to Docker Hub
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: docker/Dockerfile
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ${{ needs.build-docker.outputs.dockerhub_tags }}
+          labels: ${{ needs.build-docker.outputs.labels }}
+          cache-from: type=gha,scope=docker
+          build-args: |
+            BUILD_VERSION=${{ needs.build-docker.outputs.build_version }}
+            BUILD_DATE=${{ github.event.head_commit.timestamp }}
+            VCS_REF=${{ github.sha }}
+
+  push-ghcr:
+    needs:
+      - build-docker
+      - login-ghcr
+    runs-on: ubuntu-latest
+    if: needs.login-ghcr.outputs.logged_in == 'true'
+    permissions:
+      packages: write
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+
+      - name: Login to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Push to GHCR
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: docker/Dockerfile
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ${{ needs.build-docker.outputs.ghcr_tags }}
+          labels: ${{ needs.build-docker.outputs.labels }}
+          cache-from: type=gha,scope=docker
+          build-args: |
+            BUILD_VERSION=${{ needs.build-docker.outputs.build_version }}
+            BUILD_DATE=${{ github.event.head_commit.timestamp }}
+            VCS_REF=${{ github.sha }}
+
+  push-hassio:
+    needs:
+      - build-docker
+      - login-ghcr
+    runs-on: ubuntu-latest
+    if: needs.login-ghcr.outputs.logged_in == 'true'
+    permissions:
+      packages: write
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+
+      - name: Login to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Push to HASSIO (GHCR)
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: docker/Dockerfile
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ${{ needs.build-docker.outputs.hassio_tags }}
+          labels: ${{ needs.build-docker.outputs.labels }}
+          cache-from: type=gha,scope=docker
+          build-args: |
+            BUILD_VERSION=${{ needs.build-docker.outputs.build_version }}
+            BUILD_DATE=${{ github.event.head_commit.timestamp }}
+            VCS_REF=${{ github.sha }}
+
+  push-hassio-dev:
+    needs:
+      - build-docker
+      - login-ghcr
+    runs-on: ubuntu-latest
+    if: github.ref == 'refs/heads/dev' && needs.login-ghcr.outputs.logged_in == 'true'
+    permissions:
+      packages: write
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+
+      - name: Login to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Get short SHA
+        id: short_sha
+        run: echo "sha=$(echo ${{ github.sha }} | cut -c1-7)" >> $GITHUB_OUTPUT
+
+      - name: Push to HASSIO dev image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: docker/Dockerfile
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: |
+            ${{ env.HASSIO_DEV_IMAGE }}:latest
+            ${{ env.HASSIO_DEV_IMAGE }}:sha-${{ steps.short_sha.outputs.sha }}
+          labels: ${{ needs.build-docker.outputs.labels }}
+          cache-from: type=gha,scope=docker
+          build-args: |
+            BUILD_VERSION=${{ needs.build-docker.outputs.build_version }}
+            BUILD_DATE=${{ github.event.head_commit.timestamp }}
+            VCS_REF=${{ github.sha }}
+
+      # Push to separate HASSIO dev image (HAOS doesn't allow tags in image field)
+      - name: Push to HASSIO dev image
+        if: github.ref == 'refs/heads/dev'
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: docker/Dockerfile
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ${{ env.HASSIO_DEV_IMAGE }}:latest
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha,scope=docker
+          build-args: |
+            BUILD_DATE=${{ github.event.head_commit.timestamp }}
+            VCS_REF=${{ github.sha }}
+
+  # ==========================================================================
+  # Update Docker Hub README
+  # ==========================================================================
+  update-readme:
+    runs-on: ubuntu-latest
+    needs: push-dockerhub
+    if: github.ref == 'refs/heads/main'
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+
+      - name: Update Docker Hub description
+        uses: peter-evans/dockerhub-description@v5
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+          repository: ${{ env.DOCKERHUB_IMAGE }}
+          readme-filepath: ./README.md
+
+  # ==========================================================================
+  # Update HAOS Dev Add-on Version (commit SHA on main branch)
+  # ==========================================================================
+  update-addon-version-dev:
+    runs-on: ubuntu-latest
+    needs: build-docker
+    if: github.ref == 'refs/heads/dev'
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout main branch
+        uses: actions/checkout@v6
+        with:
+          ref: main
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Update multiroom-audio-dev config.yaml with commit SHA
+        run: |
+          SHORT_SHA=$(echo "${{ github.sha }}" | cut -c1-7)
+          sed -i "s/^version: .*/version: \"sha-${SHORT_SHA}\"/" multiroom-audio-dev/config.yaml
+          echo "Updated multiroom-audio-dev/config.yaml to version sha-${SHORT_SHA}"
+          cat multiroom-audio-dev/config.yaml | head -5
+
+      - name: Update multiroom-audio-dev DOCS.md with dev changes
+        shell: bash
+        run: |
+          SHORT_SHA=$(echo "${{ github.sha }}" | cut -c1-7)
+
+          # Fetch dev branch to get commit history
+          git fetch origin dev
+
+          # Get the last release tag
+          LAST_TAG=$(git describe --tags --abbrev=0 2>/dev/null || echo "")
+
+          # Get commit messages since last tag from dev branch
+          if [ -n "$LAST_TAG" ]; then
+            COMMITS=$(git log origin/dev --oneline ${LAST_TAG}..origin/dev --pretty=format:"- %s" | grep -v "\[skip ci\]" | head -20)
+            SINCE_TEXT="since $LAST_TAG"
+          else
+            COMMITS=$(git log origin/dev --oneline -10 --pretty=format:"- %s" | grep -v "\[skip ci\]")
+            SINCE_TEXT="(recent)"
+          fi
+
+          # Create the dev version info block using heredoc
+          cat > /tmp/dev_info.txt << DEVEOF
+          ## Development Build: sha-${SHORT_SHA}
+
+          **Current Dev Build Changes** ${SINCE_TEXT}
+
+          ${COMMITS}
+
+          > WARNING: This is a development build. For stable releases, use the stable add-on.
+          DEVEOF
+
+          # Remove leading spaces from heredoc
+          sed -i 's/^          //' /tmp/dev_info.txt
+
+          # Check if multiroom-audio-dev/DOCS.md has VERSION_INFO markers
+          if grep -q "VERSION_INFO_START" multiroom-audio-dev/DOCS.md 2>/dev/null; then
+            head -n $(grep -n "VERSION_INFO_START" multiroom-audio-dev/DOCS.md | cut -d: -f1) multiroom-audio-dev/DOCS.md > /tmp/docs_new.md
+            cat /tmp/dev_info.txt >> /tmp/docs_new.md
+            tail -n +$(grep -n "VERSION_INFO_END" multiroom-audio-dev/DOCS.md | cut -d: -f1) multiroom-audio-dev/DOCS.md >> /tmp/docs_new.md
+            mv /tmp/docs_new.md multiroom-audio-dev/DOCS.md
+            echo "Updated multiroom-audio-dev/DOCS.md with dev changes"
+          else
+            echo "No VERSION_INFO markers in multiroom-audio-dev/DOCS.md, skipping"
+          fi
+
+      - name: Commit and push version update to main
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add multiroom-audio-dev/config.yaml multiroom-audio-dev/DOCS.md
+          if git diff --staged --quiet; then
+            echo "No version change needed"
+          else
+            git commit -m "chore: update dev add-on version to sha-$(echo "${{ github.sha }}" | cut -c1-7) [skip ci]"
+            git push origin main
+            echo "Dev add-on version bump committed to main"
+          fi
+
+  # ==========================================================================
+  # Update HAOS Add-on Version (after successful tag build)
+  # ==========================================================================
+  update-addon-version:
+    runs-on: ubuntu-latest
+    needs: build-docker
+    if: startsWith(github.ref, 'refs/tags/v')
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+        with:
+          ref: main
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Extract version from tag
+        id: version
+        run: |
+          # Strip 'v' prefix from tag (v1.2.6 -> 1.2.6)
+          VERSION="${GITHUB_REF#refs/tags/v}"
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
+          echo "Extracted version: $VERSION"
+
+      - name: Update config.yaml version
+        run: |
+          # Update version in config.yaml
+          sed -i 's/^version: ".*"/version: "${{ steps.version.outputs.version }}"/' multiroom-audio/config.yaml
+          echo "Updated config.yaml to version ${{ steps.version.outputs.version }}"
+          cat multiroom-audio/config.yaml | head -5
+
+      - name: Update DOCS.md with release info
+        shell: bash
+        run: |
+          VERSION="${{ steps.version.outputs.version }}"
+
+          # Extract release notes from CHANGELOG.md for this version
+          # Get the section between this version header and the next version header (or ---)
+          RELEASE_NOTES=$(awk "/^## \[${VERSION}\]/{flag=1; next} /^## \[|^---/{if(flag) exit} flag" multiroom-audio/CHANGELOG.md | head -20)
+
+          # Get the release title (line after version header in CHANGELOG)
+          RELEASE_TITLE=$(grep -A1 "^## \[${VERSION}\]" multiroom-audio/CHANGELOG.md | tail -1 | sed 's/^### //' || echo "")
+
+          # Create the release version info block
+          cat > /tmp/release_info.txt << RELEOF
+          ## Latest Release: ${VERSION}
+
+          ${RELEASE_TITLE}
+          ${RELEASE_NOTES}
+
+          [View full changelog](https://github.com/chrisuthe/Multi-SendSpin-Player-Container/blob/main/multiroom-audio/CHANGELOG.md)
+          RELEOF
+
+          # Remove leading spaces from heredoc
+          sed -i 's/^          //' /tmp/release_info.txt
+
+          # Replace the VERSION_INFO section in DOCS.md
+          head -n $(grep -n "VERSION_INFO_START" multiroom-audio/DOCS.md | cut -d: -f1) multiroom-audio/DOCS.md > /tmp/docs_new.md
+          cat /tmp/release_info.txt >> /tmp/docs_new.md
+          tail -n +$(grep -n "VERSION_INFO_END" multiroom-audio/DOCS.md | cut -d: -f1) multiroom-audio/DOCS.md >> /tmp/docs_new.md
+          mv /tmp/docs_new.md multiroom-audio/DOCS.md
+
+          echo "Updated DOCS.md with release info for ${VERSION}"
+
+      - name: Commit and push version update
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add multiroom-audio/config.yaml multiroom-audio/DOCS.md
+          # Only commit if there are changes
+          if git diff --staged --quiet; then
+            echo "No version change needed"
+          else
+            git commit -m "chore: bump HAOS add-on version to ${{ steps.version.outputs.version }} [skip ci]"
+            git push origin main
+            echo "Version bump committed and pushed"
+          fi

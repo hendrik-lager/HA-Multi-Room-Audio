@@ -1,0 +1,29 @@
+name: Lint and Build
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  build-and-lint:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+
+      - name: Set up .NET 8.0
+        uses: actions/setup-dotnet@v5
+        with:
+          dotnet-version: '8.0.x'
+
+      - name: Restore dependencies
+        run: dotnet restore src/MultiRoomAudio/MultiRoomAudio.csproj
+
+      - name: Build
+        run: dotnet build src/MultiRoomAudio/MultiRoomAudio.csproj --no-restore -c Release
+
+      - name: Check formatting
+        run: dotnet format src/MultiRoomAudio/MultiRoomAudio.csproj --verify-no-changes --verbosity diagnostic

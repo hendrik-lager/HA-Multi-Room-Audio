@@ -1,0 +1,48 @@
+version: '3.8'
+
+services:
+  multiroom-audio:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile
+    container_name: multiroom-audio
+    restart: unless-stopped
+    ports:
+      - "8096:8096"
+    # Audio devices (Linux only - comment out for Windows development)
+    # devices:
+      # Pass through all audio devices (only if /dev/snd exists)
+      # - /dev/snd:/dev/snd
+    volumes:
+      # Persistent configuration storage
+      - ./config:/app/config
+      - ./logs:/app/logs
+      # Pass through ALSA configuration (optional typically used when you have a custom config)
+      - /usr/share/alsa:/usr/share/alsa:ro
+      - /etc/asound.conf:/etc/asound.conf:ro
+    environment:
+      - PULSE_SERVER=unix:/run/user/1000/pulse/native
+      - DISPLAY=${DISPLAY}
+    # required for mDNS discovery of sendspin sever
+    network_mode: host
+    privileged: false
+    cap_add:
+      - SYS_NICE
+    group_add:
+      - audio
+    user: "0:29"  # root user, audio group
+
+    # Health check
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8096/api/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+
+# Optional: Create named volumes for persistence
+volumes:
+  multiroom_config:
+    driver: local
+  multiroom_logs:
+    driver: local
